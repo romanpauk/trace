@@ -13,16 +13,16 @@
 
 TEST(trace_test, test) {
     {
+        TRACE("A");
         {
+            TRACE("B");
             for(int i = 0; i < 10; ++i) {
-                TRACE("a");
+                TRACE("C"); 
             }
+            TRACE("D");
         }
-        TRACE("b");
-        TRACE("c");
+        TRACE("E");
     }
 
-    trace::registry< trace::callstack_storage >::instance().for_each([](const trace::callstack_storage& data) {
-        std::cout << data.name() << ", " << data.total() / 1e6 / data.count() << "ms/call" << std::endl;
-    });
+    trace::frame_registry< trace::frame_data >::instance().for_each(trace::stream_dumper(std::cout));
 }

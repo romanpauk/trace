@@ -15,13 +15,20 @@ TEST(trace_test, test) {
     {
         TRACE("A");
         {
-            TRACE("B");
-            for(int i = 0; i < 10; ++i) {
-                TRACE("C"); 
+            {
+                TRACE("F");
             }
+
             TRACE("D");
+            for (int i = 0; i < 100; ++i) {
+                TRACE("C");
+            }
+
+            for(int i = 0; i < 10; ++i) {
+                TRACE("B"); 
+            }
         }
-        TRACE("E");
+        
     }
 
     trace::frame_registry< trace::frame_data >::instance().for_each(trace::stream_dumper(std::cout));

@@ -10,6 +10,9 @@
 #include <unordered_map>
 #include <sstream>
 #include <memory>
+#include <vector>
+#include <algorithm>
+#include <iomanip>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -104,25 +107,59 @@ namespace trace {
     private:
         static const int MaxDepth = 8;
 
+        struct frame_stack {
+            size_t size;
+            std::array< const frame*, MaxDepth > addresses;
+
+            bool operator == (const frame_stack& other) const {
+                return addresses == other.addresses;
+            }
+
+            bool operator < (const frame_stack& other) const {
+                return addresses < other.addresses;
+            }
+        };
+
         struct frame_stack_hash {
-            size_t operator()(const std::array< const frame*, MaxDepth >& value) const noexcept {
+            size_t operator()(const frame_stack& stack) const noexcept
+            {
                 size_t hval = 0;
                 for (size_t i = 0; i < MaxDepth; ++i)
-                    hval ^= reinterpret_cast<uintptr_t>(value[i]);
+                    hval ^= reinterpret_cast<uintptr_t>(stack.addresses[i]);
                 return hval;
             }
         };
 
-        using frame_records = std::unordered_map< std::array< const frame*, MaxDepth >, FrameData, frame_stack_hash >;
+        using frame_records = std::unordered_map< frame_stack, FrameData, frame_stack_hash >;
+
+        struct thread_data {
+            thread_data(frame_records* records) : records(records) {}
+
+            frame_stack stack{};
+            frame_data_cache< FrameData, MaxDepth, 4 > cache;
+            frame_records* records;
+        };
+
+        mutable std::mutex _mutex;
+        std::vector< std::unique_ptr< frame_records > > _records;
+
+        static frame_registry< FrameData > _instance;
+        static thread_local thread_data _thread_data;
 
     public:
         static frame_registry< FrameData >& instance() { return _instance; }
             
         template< typename Fn > void for_each(Fn&& fn) const {
             auto records = merge();
-            for (auto& [key, data]: records) {
-                fn(data);
-            }
+            auto sorted_records = sort_tree(records);
+            for_each(sorted_records, fn);
+        }
+
+        template< typename Fn > void for_each(const std::vector< FrameData* >& frames, Fn&& fn) const {
+           for (auto& data: frames) {
+                fn(*data);
+                for_each(data->children(), fn);
+           }
         }
 
         void push_frame(const frame* frame) {
@@ -132,13 +169,14 @@ namespace trace {
 
         FrameData& pop_frame() {
             auto& data = _thread_data;
-            auto frame = data.stack.addresses[--data.stack.size];
-            FrameData* framedata = data.cache.get(data.stack.size, frame);
+            auto level = data.stack.size - 1;
+            auto frame = data.stack.addresses[level];
+            FrameData* framedata = data.cache.get(level, frame);
             if (!framedata) {
-                framedata = get_frame_data(*data.records, data.stack.addresses);
-                _thread_data.cache.put(data.stack.size, frame, framedata);
+                framedata = get_frame_data(*data.records, data.stack);
+                _thread_data.cache.put(level, frame, framedata);
             }
-            data.stack.addresses[data.stack.size] = 0;
+            data.stack.addresses[--data.stack.size] = 0;
             return *framedata;
         }
 
@@ -151,14 +189,25 @@ namespace trace {
             return stream.str();
         }
 
-        FrameData* get_frame_data(frame_records& records, const std::array< const frame*, MaxDepth >& stack) {
+        FrameData* get_frame_data(frame_records& records, const frame_stack& stack) const {
             auto it = records.find(stack);
             if (it != records.end()) {
                 return &it->second;
             }
             else {
-                return &(records.emplace(stack, FrameData(get_frame_name(stack))).first->second);
+                return &(records.emplace(stack,
+                    FrameData(get_parent_frame_data(records, stack), get_frame_name(stack.addresses))).first->second);
             }
+        }
+
+        FrameData* get_parent_frame_data(frame_records& records, const frame_stack& stack) const {
+            FrameData* parent_data = nullptr;
+            if (stack.size > 1) {
+                auto parent_stack(stack);
+                parent_stack.addresses[--parent_stack.size] = 0;
+                parent_data = get_frame_data(records, parent_stack);
+            }
+            return parent_data;
         }
 
         frame_records* create_frame_records() {
@@ -172,31 +221,35 @@ namespace trace {
             frame_records records;
             for (auto& record : _records) {
                 for (auto& [key, data] : *record) {
-                    auto& mergeddata = records.emplace(key, data.name()).first->second;
+                    auto& mergeddata = records.emplace(key, FrameData(nullptr, data.name())).first->second;
                     mergeddata.merge(data);
                 }
             }
+
+            for (auto& [key, data] : records) {
+                auto parent = get_parent_frame_data(records, key);
+                if (parent) {
+                    data.set_parent(parent);
+                    parent->add_child(&data);
+                }
+            }
+            
             return records;
         }
 
-        struct frame_stack {
-            size_t size;
-            std::array< const frame*, MaxDepth > addresses;
-        };
+        std::vector< FrameData* > sort_tree(frame_records& records) const {
+            auto compare = [&](const FrameData* lhs, const FrameData* rhs) { return lhs->time() > rhs->time(); };
+            std::vector< FrameData* > result;
+            for (auto& [key, data] : records) {
+                if (!data.parent()) {
+                    data.sort_children(compare);
+                    result.push_back(&data);
+                }
+            }
 
-        struct thread_data {
-            thread_data(frame_records* records): records(records) {}
-
-            frame_stack stack {};
-            frame_data_cache< FrameData, MaxDepth, 4 > cache;
-            frame_records* records;
-        };
-
-        mutable std::mutex _mutex;
-        std::vector< std::unique_ptr< frame_records > > _records;
-
-        static frame_registry< FrameData > _instance;
-        static thread_local thread_data _thread_data;
+            std::sort(result.begin(), result.end(), compare);
+            return result;
+        }
     };
 
     template< typename FrameData > frame_registry<FrameData> frame_registry<FrameData>::_instance;
@@ -204,7 +257,19 @@ namespace trace {
         frame_registry<FrameData>::instance().create_frame_records());
 
     struct frame_data {
-        frame_data(std::string name): _name(name) {}
+        frame_data(const frame_data* parent, std::string name)
+            : _name(name)
+            , _parent(parent)
+        {}
+
+        void set_parent(const frame_data* parent) { _parent = parent; }
+        const frame_data* parent() const { return _parent; }
+        void add_child(frame_data* child) { _children.push_back(child); }
+        const std::vector< frame_data* > children() const { return _children; }
+        template< typename Fn > void sort_children(Fn&& fn) {
+            std::sort(_children.begin(), _children.end(), fn);
+            for (auto& child: _children) { child->sort_children(fn); }
+        }
 
         const std::string& name() const { return _name; }
 
@@ -216,8 +281,13 @@ namespace trace {
             _time += other._time;
             _count += other._count;
         }
+
         
     private:
+        // TODO: this does not belong here
+        const frame_data* _parent {};
+        std::vector< frame_data* > _children;
+
         std::string _name;
         uint64_t _time = 0;
         uint64_t _count = 0;
@@ -241,13 +311,14 @@ namespace trace {
     };
 
     struct stream_dumper {
-        stream_dumper(std::ostream& stream): _stream(stream) {}
+        stream_dumper(std::ostream& stream, size_t div = 1): _stream(stream), _div(div) {}
 
         void operator () (const frame_data& data) {
-            _stream << data.name() << ", " << data.time() / 1e6 / data.call_count() << "ms/call" << std::endl;
+            _stream << data.name() << ", " << std::fixed << std::setprecision(2) << data.time() / 1e6 / data.call_count() / _div << "ms/call" << std::endl;
         }
 
     private:
+        size_t _div;
         std::ostream& _stream;
     };
 }

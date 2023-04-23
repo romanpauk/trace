@@ -11,12 +11,21 @@
 
 #include <iostream>
 
+static void fn()
+{
+    TRACE(__FUNCTION__);
+}
+
 TEST(trace_test, test) {
     {
         TRACE("A");
+        fn();
         {
+            std::string b("bbbb");
+            fn();
             {
                 TRACE("F");
+                fn();
             }
 
             TRACE("D");
@@ -25,7 +34,9 @@ TEST(trace_test, test) {
             }
 
             for(int i = 0; i < 10; ++i) {
-                TRACE("B"); 
+                TRACE("B");
+                std::string a("aaaa");
+                fn();
             }
         }
         

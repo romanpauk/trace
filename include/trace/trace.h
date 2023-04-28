@@ -12,15 +12,20 @@
 #include <sstream>
 #include <memory>
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <iomanip>
+#include <thread>
+#include <chrono>
 
 #if defined(_WIN32)
 #define NOMINMAX
+#include <intrin.h>
 #include <windows.h>
 #endif
 
 #if defined(__linux__)
+#include <x86gprintrin.h>
 #include <ctime>
 #endif
 
@@ -29,9 +34,11 @@
 namespace trace {
 
 #if defined(__linux__)
-    struct time_traits {
+    template< clockid_t id > struct clock_gettime_time_traits {
         using value_type = timespec;
-        static void get(value_type& value) { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value); }
+        static void begin(value_type& value) { get(value); }
+        static void end(value_type& value) { get(value); }
+        static void get(value_type& value) { clock_gettime(id, &value); }
         static uint64_t diff(const value_type& end, const value_type& begin) {
             uint64_t value = (end.tv_sec - begin.tv_sec) * 1e9 + (end.tv_nsec - begin.tv_nsec);
             return value;
@@ -40,9 +47,14 @@ namespace trace {
 #endif
 
 #if defined(_WIN32)
-    struct time_traits {
+    struct qpc_time_traits {
         using value_type = LARGE_INTEGER;
-        static void get(value_type& value) { QueryPerformanceCounter(&value); }
+        static void begin(value_type& value) { get(value); }
+        static void end(value_type& value) { get(value); }
+
+        static void get(value_type& value) {
+            QueryPerformanceCounter(&value);
+        }
         static uint64_t diff(const value_type& end, const value_type& begin) {
             value_type elapsed;
             elapsed.QuadPart = end.QuadPart - begin.QuadPart;
@@ -53,8 +65,7 @@ namespace trace {
 
     private:
         static const value_type& frequency() {
-            static value_type freq = []()
-            {
+            static value_type freq = []() {
                 value_type value;
                 QueryPerformanceFrequency(&value);
                 return value;
@@ -64,6 +75,51 @@ namespace trace {
     };
 #endif
 
+    // This assumes constant inviarant TSC
+    template< typename CTraits > struct rdtscp_time_traits
+    {
+        using value_type = uint64_t;
+
+        static void begin(value_type& value) { get(value); }
+        static void end(value_type& value) { get(value); }
+
+        static void get(value_type& value) {
+            unsigned dummy;
+            value = __rdtscp(&dummy);
+        }
+
+        static uint64_t diff(const value_type& end, const value_type& begin) {
+            return double(end - begin) / _frequency;
+        }
+
+    private:
+        static double get_frequency() {
+            value_type start, stop;
+
+            typename CTraits::value_type cstart, cstop;
+            CTraits::begin(cstart);
+            begin(start);
+	        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            end(stop);
+            CTraits::end(cstop);
+
+            auto cdiff = CTraits::diff(cstop, cstart);
+            return double(stop - start) / cdiff;
+        }
+
+        static double _frequency;
+    };
+
+    template< typename CTraits > double rdtscp_time_traits< CTraits >::_frequency = rdtscp_time_traits< CTraits >::get_frequency();
+
+#if defined(_WIN32)
+    using default_time_traits = rdtscp_time_traits< qpc_time_traits >;
+#elif defined(__linux__)
+    using default_time_traits = clock_gettime_time_traits< CLOCK_MONOTONIC >;
+#else
+    #error "don't know how to measure"
+#endif
+
     struct frame {
         frame(const char* name) : _name(name) {}
         const char* name() const { return _name; }
@@ -71,38 +127,30 @@ namespace trace {
         const char* _name;
     };
 
-    template< typename FrameData > struct frame_registry {
-    private:
-        static const int MaxDepth = 16;
-
-        struct frame_stack {
-            size_t size;
-            std::array< const frame*, MaxDepth > addresses;
-            
-            bool operator == (const frame_stack& other) const {
-                return addresses == other.addresses;
-            }
-
-            bool operator < (const frame_stack& other) const {
-                return addresses < other.addresses;
-            }
-        };
-
-        struct frame_stack_hash {
+    struct frame_stack {
+        struct hash {
             size_t operator()(const frame_stack& stack) const noexcept {
                 size_t hval = 0;
-                for (size_t i = 0; i < MaxDepth; ++i)
+                for (size_t i = 0; i < stack.addresses.size(); ++i)
                     hval ^= reinterpret_cast<uintptr_t>(stack.addresses[i]);
                 return hval;
             }
         };
 
-        using frame_records = std::unordered_map< frame_stack, FrameData, frame_stack_hash >;
+        bool operator == (const frame_stack& other) const { return addresses == other.addresses; }
+        bool operator < (const frame_stack& other) const { return addresses < other.addresses; }
 
+        std::deque< const frame* > addresses;
+    };
+    
+    template< typename FrameData > struct frame_registry {
+    private:
+        using frame_records = std::unordered_map< frame_stack, FrameData, frame_stack::hash >;
+        
         struct thread_data {
             thread_data(frame_records* records) : records(records) {}
 
-            frame_stack stack{};
+            frame_stack stack;
             frame_records* records;
         };
 
@@ -111,6 +159,7 @@ namespace trace {
 
         static frame_registry< FrameData > _instance;
         static thread_local thread_data _thread_data;
+        static double _trace_overhead;
 
     public:
         static frame_registry< FrameData >& instance() { return _instance; }
@@ -129,54 +178,53 @@ namespace trace {
         }
 
         FrameData* push_frame(const frame* frame) {
-            auto& data = _thread_data;
-            auto level = data.stack.size++;
-            data.stack.addresses[level] = frame;
-
-            // Create frame data
-            return get_frame_data(data, data.stack);
+            auto& thread_data = _thread_data;
+            thread_data.stack.addresses.push_back(frame);
+            return get_frame_data(thread_data, thread_data.stack);
         }
 
         void pop_frame() {
-            auto& data = _thread_data;
-            data.stack.addresses[--data.stack.size] = 0;
+            auto& thread_data = _thread_data;
+            thread_data.stack.addresses.pop_back();
         }
 
+        void clear() {
+            for (auto& record : _records) {
+                record->clear();
+            }
+        }
+
+        double trace_overhead() { return _trace_overhead; }
+
     private:
-        static std::string get_frame_name(const std::array< const frame*, MaxDepth >& stack) {
+        static std::string get_frame_name(const frame_stack& stack) {
             std::stringstream stream;
-            stream << stack[0]->name();
-            for(size_t i = 1; i < MaxDepth; ++i) {
-                if (!stack[i])
-                    break;
-                stream << '/' << stack[i]->name();
+            stream << stack.addresses[0]->name();
+            for(size_t i = 1; i < stack.addresses.size(); ++i) {
+                stream << '/' << stack.addresses[i]->name();
             }
             return stream.str();
         }
 
         FrameData* get_frame_data(thread_data& data, const frame_stack& stack) const {
-            frame_records& records = *data.records;
-            auto level = stack.size - 1;
-            FrameData* framedata = 0;
-            if (framedata)
-                return framedata;
+            FrameData* framedata = nullptr;
+            auto& records = *data.records;
             auto it = records.find(stack);
             if (it != records.end()) {
                 framedata = &it->second;
-            }
-            else {
-                auto frame = stack.addresses[stack.size - 1];
+            } else {
+                auto frame = stack.addresses.back();
                 framedata = &(records.emplace(stack,
-                    FrameData(get_parent_frame_data(data, stack), get_frame_name(stack.addresses), frame->name())).first->second);
+                    FrameData(get_parent_frame_data(data, stack), get_frame_name(stack), frame->name())).first->second);
             }
             return framedata;
         }
 
         FrameData* get_parent_frame_data(thread_data& data, const frame_stack& stack) const {
             FrameData* parent_data = nullptr;
-            if (stack.size > 1) {
+            if (stack.addresses.size() > 1) {
                 auto parent_stack(stack);
-                parent_stack.addresses[--parent_stack.size] = 0;
+                parent_stack.addresses.pop_back();
                 parent_data = get_frame_data(data, parent_stack);
             }
             return parent_data;
@@ -195,7 +243,7 @@ namespace trace {
             // Merge symbols together from different threads/callstacks
             for (auto& record : _records) {
                 for (auto& [key, data] : *record) {
-                    auto& mergeddata = records.emplace(data.name(), FrameData(data.parent(), data.name(), data.short_name())).first->second;
+                    auto& mergeddata = records.emplace(data.long_name(), FrameData(data.parent(), data.long_name(), data.short_name())).first->second;
                     mergeddata.merge(data);
                 }
             }
@@ -203,7 +251,7 @@ namespace trace {
             // Create parent/child relationships according to merged symbols
             for (auto& [key, data] : records) {
                 if (data.parent()) {
-                    auto& parent = records[data.parent()->name()];
+                    auto& parent = records[data.parent()->long_name()];
                     data.set_parent(&parent);
                     parent.add_child(&data);
                 }
@@ -234,8 +282,8 @@ namespace trace {
     struct frame_data {
         frame_data() = default;
 
-        frame_data(const frame_data* parent, std::string name, std::string short_name)
-            : _name(name)
+        frame_data(const frame_data* parent, std::string long_name, std::string short_name)
+            : _long_name(long_name)
             , _short_name(short_name)
             , _parent(parent)
         {}
@@ -249,12 +297,19 @@ namespace trace {
             for (auto& child: _children) { child->sort_children(fn); }
         }
 
-        const std::string& name() const { return _name; }
+        const std::string& long_name() const { return _long_name; }
         const std::string& short_name() const { return _short_name; }
 
         void add_time(uint64_t value) { _time += value; _count += 1; }
         uint64_t time() const { return _time; }
-        uint64_t call_count() const { return _count; }
+
+        uint64_t exclusive_count() const { return _count; }
+
+        uint64_t inclusive_count() const {
+            uint64_t count = exclusive_count();
+            for (auto& child : _children) { count += child->inclusive_count(); }
+            return count;
+        }
 
         void merge(const frame_data& other) {
             _time += other._time;
@@ -265,21 +320,21 @@ namespace trace {
         // TODO: this does not belong here
         const frame_data* _parent {};
         std::vector< frame_data* > _children;
-        std::string _name;
+        std::string _long_name;
         std::string _short_name;
 
         uint64_t _time = 0;
         uint64_t _count = 0;
     };
 
-    template< typename FrameData, typename TimeTraits = time_traits > struct frame_guard {
+    template< typename FrameData, typename TimeTraits = default_time_traits > struct frame_guard {
         frame_guard(const frame* frame): _frame_data(frame_registry< FrameData >::instance().push_frame(frame)) {
-            TimeTraits::get(_begin);
+            TimeTraits::begin(_begin);
         }
 
         ~frame_guard() {
             typename TimeTraits::value_type end;
-            TimeTraits::get(end);
+            TimeTraits::end(end);
             _frame_data->add_time(TimeTraits::diff(end, _begin));
             frame_registry< FrameData >::instance().pop_frame();
         }
@@ -289,17 +344,50 @@ namespace trace {
         typename TimeTraits::value_type _begin;
     };
 
+    template< typename FrameData > double frame_registry<FrameData>::_trace_overhead = []()
+    {
+        const size_t N = 100000;
+        auto run = [&N]()
+        {
+            for (size_t i = 0; i < N; ++i) {
+                static frame frame(__FUNCTION__);
+                frame_guard< ::trace::frame_data > trace_guard(&frame);
+            }
+        };
+
+        run();
+
+        default_time_traits::value_type begin, end;
+        default_time_traits::begin(begin);
+        run();
+        default_time_traits::end(end);
+
+        frame_registry<FrameData>::instance().clear();
+
+        return default_time_traits::diff(end, begin) / N;
+    }();
+    
     struct stream_dumper {
-        stream_dumper(std::ostream& stream, size_t div = 1): _stream(stream), _div(div) {}
+        stream_dumper(std::ostream& stream, double scale = 1): _stream(stream), _scale(scale) {}
 
         void operator () (const frame_data& data, size_t level) {
-            _stream << "CALLTRACE: " << indent(level) << data.short_name() << ": " << std::fixed << std::setprecision(6) << double(data.time()) / 1e6 << "ms (" << double(data.time())/1.e6/data.call_count() << "ms/call), count " << data.call_count() << std::endl;
+            auto total_time = double(data.time()) / 1e6 * _scale;
+            auto call_time = double(data.time()) / 1e6 / data.exclusive_count();
+            auto overhead_count = std::max(uint64_t(0), data.inclusive_count() - data.exclusive_count());
+            auto overhead_time = frame_registry< frame_data >::instance().trace_overhead() * overhead_count;
+            _stream << "CALLTRACE: " << indent(level)
+                << data.short_name() << ": " << std::fixed << std::setprecision(6) << total_time
+                << "ms (avg " << call_time << "ms/call, count=" << data.exclusive_count();
+            if (overhead_count) {
+                _stream << ", err=" << std::setprecision(2) << overhead_time / data.time() * 100 << "%";
+            }
+            _stream << ")" << std::endl;
         }
 
     private:
         std::string indent(size_t level) { return std::string(level * 4, ' '); }
 
-        size_t _div;
+        double _scale;
         std::ostream& _stream;
     };
 }

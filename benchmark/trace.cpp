@@ -8,8 +8,22 @@
 #include <benchmark/benchmark.h>
 #include <trace/trace.h>
 #include <string>
+#include <iostream>
 
 BENCHMARK_MAIN();
+
+template< typename T > static void time_traits_get(benchmark::State& state)
+{
+    typename T::value_type start, end;
+    for (auto _ : state) {
+        T::get(start);
+        T::get(end);
+    }
+
+    //std::cerr << T::diff(end, start) << std::endl;
+    state.SetBytesProcessed(state.iterations()*2);
+    benchmark::DoNotOptimize(start);
+}
 
 static void BM_StringCopy(benchmark::State& state)
 {
@@ -44,6 +58,17 @@ static void BM_MapCopyTrace(benchmark::State& state)
         auto copy = x;
     }
 }
+
+#if defined(_WIN32)
+BENCHMARK_TEMPLATE(time_traits_get, trace::qpc_time_traits);
+#endif
+
+#if defined(__linux__)
+BENCHMARK_TEMPLATE(time_traits_get, trace::clock_gettime_time_traits< CLOCK_MONOTONIC >);
+BENCHMARK_TEMPLATE(time_traits_get, trace::clock_gettime_time_traits< CLOCK_THREAD_CPUTIME_ID >);
+#endif
+
+BENCHMARK_TEMPLATE(time_traits_get, trace::default_time_traits);
 
 BENCHMARK(BM_StringCopy);
 BENCHMARK(BM_StringCopyTrace);

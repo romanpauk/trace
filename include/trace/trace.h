@@ -25,7 +25,7 @@
 #endif
 
 #if defined(__linux__)
-#include <x86gprintrin.h>
+#include <x86intrin.h>
 #include <ctime>
 #endif
 
@@ -36,10 +36,12 @@ namespace trace {
 #if defined(__linux__)
     template< clockid_t id > struct clock_gettime_time_traits {
         using value_type = timespec;
-        static void begin(value_type& value) { get(value); }
-        static void end(value_type& value) { get(value); }
-        static void get(value_type& value) { clock_gettime(id, &value); }
-        static uint64_t diff(const value_type& end, const value_type& begin) {
+        static value_type get() {
+            value_type value;
+            clock_gettime(id, &value);
+            return value;
+        }
+        static double diff(const value_type& end, const value_type& begin) {
             uint64_t value = (end.tv_sec - begin.tv_sec) * 1e9 + (end.tv_nsec - begin.tv_nsec);
             return value;
         }
@@ -49,22 +51,21 @@ namespace trace {
 #if defined(_WIN32)
     struct qpc_time_traits {
         using value_type = LARGE_INTEGER;
-        static void begin(value_type& value) { get(value); }
-        static void end(value_type& value) { get(value); }
-
-        static void get(value_type& value) {
+        static value_type get() {
+            value_type value;
             QueryPerformanceCounter(&value);
+            return value;
         }
-        static uint64_t diff(const value_type& end, const value_type& begin) {
+        static double diff(const value_type& end, const value_type& begin) {
             value_type elapsed;
             elapsed.QuadPart = end.QuadPart - begin.QuadPart;
             elapsed.QuadPart *= 1e9;
-            elapsed.QuadPart /= frequency().QuadPart;
+            elapsed.QuadPart /= get_frequency().QuadPart;
             return elapsed.QuadPart;
         }
 
     private:
-        static const value_type& frequency() {
+        static const value_type& get_frequency() {
             static value_type freq = []() {
                 value_type value;
                 QueryPerformanceFrequency(&value);
@@ -76,46 +77,70 @@ namespace trace {
 #endif
 
     // This assumes constant inviarant TSC
-    template< typename CTraits > struct rdtscp_time_traits
-    {
+    template< typename CTraits > struct rdtsc_time_traits {
         using value_type = uint64_t;
 
-        static void begin(value_type& value) { get(value); }
-        static void end(value_type& value) { get(value); }
+        static value_type get() {
+            _mm_lfence();
+            auto res = __rdtsc();
+            _mm_lfence();
+            return res;
 
-        static void get(value_type& value) {
-            unsigned dummy;
-            value = __rdtscp(&dummy);
+            //unsigned dummy;
+            //auto res = __rdtscp(&dummy);
+            //_mm_lfence();
+            //return res;
         }
 
-        static uint64_t diff(const value_type& end, const value_type& begin) {
-            return double(end - begin) / _frequency;
+        static double diff(const value_type& end, const value_type& begin) {
+            return double(end - begin) / get_frequency();
         }
 
-    private:
         static double get_frequency() {
-            value_type start, stop;
-
-            typename CTraits::value_type cstart, cstop;
-            CTraits::begin(cstart);
-            begin(start);
-	        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            end(stop);
-            CTraits::end(cstop);
-
-            auto cdiff = CTraits::diff(cstop, cstart);
-            return double(stop - start) / cdiff;
+            static double frequency = calculate_frequency();
+            return frequency;
         }
 
-        static double _frequency;
+        static uint64_t get_overhead() {
+            static uint64_t overhead = calculate_overhead();
+            return overhead;
+        }
+        
+    private:
+        static double calculate_frequency() {
+            double freq = 0;
+            const int N = 100;
+            for (size_t i = 0; i < N; ++i) {
+                auto cstart = CTraits::get();
+                auto start = get();
+	            for(size_t i = 0; i < 100000; ++i)
+                    _mm_pause();
+                auto stop = get();
+                auto cstop = CTraits::get();
+                freq += double(stop - start) / CTraits::diff(cstop, cstart);
+            }
+
+            return freq / N;
+        }
+
+        static uint64_t calculate_overhead() {
+            const int N = 100;
+            uint64_t x = 0, y = 0, min = -1;
+      
+            for (size_t i = 0; i < N; ++i) {
+                x = get();
+                y = get();
+                min = std::min(min, y - x);
+            }
+
+            return min;
+        }
     };
 
-    template< typename CTraits > double rdtscp_time_traits< CTraits >::_frequency = rdtscp_time_traits< CTraits >::get_frequency();
-
 #if defined(_WIN32)
-    using default_time_traits = rdtscp_time_traits< qpc_time_traits >;
+    using default_time_traits = rdtsc_time_traits< qpc_time_traits >;
 #elif defined(__linux__)
-    using default_time_traits = clock_gettime_time_traits< CLOCK_MONOTONIC >;
+    using default_time_traits = rdtsc_time_traits< clock_gettime_time_traits< CLOCK_MONOTONIC > >;
 #else
     #error "don't know how to measure"
 #endif
@@ -329,12 +354,11 @@ namespace trace {
 
     template< typename FrameData, typename TimeTraits = default_time_traits > struct frame_guard {
         frame_guard(const frame* frame): _frame_data(frame_registry< FrameData >::instance().push_frame(frame)) {
-            TimeTraits::begin(_begin);
+            _begin = TimeTraits::get();
         }
 
         ~frame_guard() {
-            typename TimeTraits::value_type end;
-            TimeTraits::end(end);
+            auto end = TimeTraits::get();
             _frame_data->add_time(TimeTraits::diff(end, _begin));
             frame_registry< FrameData >::instance().pop_frame();
         }
@@ -344,42 +368,44 @@ namespace trace {
         typename TimeTraits::value_type _begin;
     };
 
-    template< typename FrameData > double frame_registry<FrameData>::_trace_overhead = []()
-    {
-        const size_t N = 100000;
-        auto run = [&N]()
-        {
-            for (size_t i = 0; i < N; ++i) {
+    template< typename FrameData > double frame_registry<FrameData>::_trace_overhead = []() {
+        auto run = [](size_t n) {
+            for (size_t i = 0; i < n; ++i) {
                 static frame frame(__FUNCTION__);
                 frame_guard< ::trace::frame_data > trace_guard(&frame);
             }
         };
 
-        run();
+        const size_t n = 100;
+        run(n);
 
-        default_time_traits::value_type begin, end;
-        default_time_traits::begin(begin);
-        run();
-        default_time_traits::end(end);
-
+        auto begin = default_time_traits::get();
+        run(n);
+        auto end = default_time_traits::get();
+        
         frame_registry<FrameData>::instance().clear();
 
-        return default_time_traits::diff(end, begin) / N;
+        return default_time_traits::diff(end, begin) / n;
     }();
     
     struct stream_dumper {
         stream_dumper(std::ostream& stream, double scale = 1): _stream(stream), _scale(scale) {}
 
         void operator () (const frame_data& data, size_t level) {
-            auto total_time = double(data.time()) / 1e6 * _scale;
-            auto call_time = double(data.time()) / 1e6 / data.exclusive_count();
+            auto total_time = double(data.time()) * _scale / 1e6;
+            auto avg_time = double(data.time()) / data.exclusive_count() / 1e6;
             auto overhead_count = std::max(uint64_t(0), data.inclusive_count() - data.exclusive_count());
             auto overhead_time = frame_registry< frame_data >::instance().trace_overhead() * overhead_count;
-            _stream << "CALLTRACE: " << indent(level)
-                << data.short_name() << ": " << std::fixed << std::setprecision(6) << total_time
-                << "ms (avg " << call_time << "ms/call, count=" << data.exclusive_count();
+            auto cycles = uint64_t(data.time() * default_time_traits::get_frequency() / data.exclusive_count()) - default_time_traits::get_overhead();
+
+            _stream << "CALLTRACE: " << indent(level) << std::fixed << std::setprecision(6)
+                << data.short_name() << ": " << total_time
+                << "ms (" << avg_time << "ms/call, count=" << data.exclusive_count();
             if (overhead_count) {
-                _stream << ", err=" << std::setprecision(2) << overhead_time / data.time() * 100 << "%";
+                _stream << ", err=" << std::setprecision(2) << (overhead_time * 100) / data.time() << "%";
+            }
+            if (cycles < 10000) {
+                _stream << ", cycles=" << cycles;
             }
             _stream << ")" << std::endl;
         }
@@ -402,4 +428,3 @@ namespace trace {
 #define TRACE(...) \
   static ::trace::frame _TRACE_NAME(_entry_frame_)(__VA_ARGS__); \
   ::trace::frame_guard< ::trace::frame_data > _TRACE_NAME(_entry_)(&_TRACE_NAME(_entry_frame_))
-  

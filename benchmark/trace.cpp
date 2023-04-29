@@ -16,8 +16,8 @@ template< typename T > static void time_traits_get(benchmark::State& state)
 {
     typename T::value_type start, end;
     for (auto _ : state) {
-        T::get(start);
-        T::get(end);
+        start = T::get();
+        end = T::get();
     }
 
     //std::cerr << T::diff(end, start) << std::endl;

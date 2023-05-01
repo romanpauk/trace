@@ -8,10 +8,8 @@
 #include <array>
 #include <mutex>
 #include <unordered_map>
-#include <map>
 #include <sstream>
 #include <memory>
-#include <vector>
 #include <deque>
 #include <algorithm>
 #include <iomanip>
@@ -30,6 +28,8 @@
 #endif
 
 #pragma once
+
+#define TRACE_ENABLED
 
 namespace trace {
 
@@ -101,8 +101,8 @@ namespace trace {
             return frequency;
         }
 
-        static uint64_t get_overhead() {
-            static uint64_t overhead = calculate_overhead();
+        static const std::tuple< uint64_t, double, uint64_t >& get_overhead() {
+            static std::tuple< uint64_t, double, uint64_t > overhead = calculate_overhead();
             return overhead;
         }
         
@@ -110,11 +110,14 @@ namespace trace {
         static double calculate_frequency() {
             double freq = 0;
             const int N = 100;
+            unsigned dummy;
+            volatile uint64_t dummyval;
+
             for (size_t i = 0; i < N; ++i) {
                 auto cstart = CTraits::get();
                 auto start = get();
 	            for(size_t i = 0; i < 100000; ++i)
-                    _mm_pause();
+                    dummyval = __rdtscp(&dummy);
                 auto stop = get();
                 auto cstop = CTraits::get();
                 freq += double(stop - start) / CTraits::diff(cstop, cstart);
@@ -123,17 +126,20 @@ namespace trace {
             return freq / N;
         }
 
-        static uint64_t calculate_overhead() {
-            const int N = 100;
-            uint64_t x = 0, y = 0, min = -1;
-      
+        static std::tuple< uint64_t, double, uint64_t > calculate_overhead() {
+            const int N = 1000;
+            uint64_t x = 0, y = 0, total = 0, min = -1, max = 0;
+
+            uint64_t counter = 0;
             for (size_t i = 0; i < N; ++i) {
                 x = get();
                 y = get();
+                total += y - x;
                 min = std::min(min, y - x);
+                max = std::max(max, y - x);
             }
 
-            return min;
+            return { min, double(total) / N, max };
         }
     };
 
@@ -145,9 +151,50 @@ namespace trace {
     #error "don't know how to measure"
 #endif
 
+    // See: Accurate Measurement of Small Execution Times
+    // https://uwaterloo.ca/embedded-software-group/sites/ca.embedded-software-group/files/uploads/files/ieee-esl-precise-measurements.pdf
+    template < typename TimeTraits, typename Fn > std::tuple< double, double > differential_measure(const Fn& fn) {
+        // T1 = N1F + e
+        // T2 = N2F + e
+        // F = (T2-T1)/(N2-N1)
+        // e = (N1T2-N2T1)/(N1-N2)
+
+        const int N = 10000;
+
+        int64_t begin, end, t1, t2, n1 = 1, n2 = 10;
+        double f = 0, e = 0;
+
+        for (size_t i = 0; i < N; ++i) {
+            begin = TimeTraits::get();
+            fn();
+            end = TimeTraits::get();
+            t1 = end - begin;
+
+            begin = TimeTraits::get();
+            fn();
+            fn();
+            fn();
+            fn();
+            fn();
+            fn();
+            fn();
+            fn();
+            fn();
+            fn();
+            end = TimeTraits::get();
+            t2 = end - begin;
+
+            e += double(n1 * t2 - n2 * t1) / (n1 - n2);
+            f += double(t2 - t1) / (n2 - n1);
+        }
+
+        return { f / N, e / N };
+    }
+
     struct frame {
         frame(const char* name) : _name(name) {}
         const char* name() const { return _name; }
+
     private:
         const char* _name;
     };
@@ -220,6 +267,12 @@ namespace trace {
         }
 
         double trace_overhead() { return _trace_overhead; }
+
+        static double compensate_overhead(const std::tuple< uint64_t, double, uint64_t >& overhead, double value) {
+            // TODO: the compensation is crude
+            const auto& [min, avg, max] = overhead;
+            return value > avg ? value - avg : value - min;
+        }
 
     private:
         static std::string get_frame_name(const frame_stack& stack) {
@@ -325,7 +378,7 @@ namespace trace {
         const std::string& long_name() const { return _long_name; }
         const std::string& short_name() const { return _short_name; }
 
-        void add_time(uint64_t value) { _time += value; _count += 1; }
+        void add_time(uint64_t value, uint64_t count) { _time += value * count; _count += count; }
         uint64_t time() const { return _time; }
 
         uint64_t exclusive_count() const { return _count; }
@@ -340,7 +393,17 @@ namespace trace {
             _time += other._time;
             _count += other._count;
         }
-        
+
+        uint64_t increment_sampling_counter() {
+            return _sampling_counter[0]++;
+        }
+
+        uint64_t reset_sampling_counter() {
+            auto elapsed = _sampling_counter[0] - _sampling_counter[1];
+            _sampling_counter[1] = _sampling_counter[0];
+            return elapsed;
+        }
+
     private:
         // TODO: this does not belong here
         const frame_data* _parent {};
@@ -350,42 +413,71 @@ namespace trace {
 
         uint64_t _time = 0;
         uint64_t _count = 0;
+        uint64_t _sampling_counter[2] = {0};
     };
 
-    template< typename FrameData, typename TimeTraits = default_time_traits > struct frame_guard {
-        frame_guard(const frame* frame): _frame_data(frame_registry< FrameData >::instance().push_frame(frame)) {
-            _begin = TimeTraits::get();
+    template< typename FrameData, typename TimeTraits = default_time_traits, size_t SamplingFreq = 32 > struct frame_guard {
+        frame_guard(frame* frame) {
+            _frame_data = frame_registry< FrameData >::instance().push_frame(frame);
+            _counter = _frame_data->increment_sampling_counter();
+            if ((_counter & (SamplingFreq - 1)) == 0)
+                _begin = TimeTraits::get();
         }
 
         ~frame_guard() {
-            auto end = TimeTraits::get();
-            _frame_data->add_time(TimeTraits::diff(end, _begin));
+            if ((_counter & (SamplingFreq - 1)) == 0) {
+                auto end = TimeTraits::get();
+                _frame_data->add_time(TimeTraits::diff(end, _begin), _frame_data->reset_sampling_counter());
+            }
             frame_registry< FrameData >::instance().pop_frame();
         }
 
+        static const std::tuple< uint64_t, double, uint64_t >& get_overhead() {
+            static std::tuple< uint64_t, double, uint64_t > overhead = calculate_overhead();
+            return overhead;
+        }
+
     private:
+        static std::tuple< uint64_t, double, uint64_t > calculate_overhead() {
+            const int N = 1000;
+            uint64_t x = 0, y = 0, total = 0, min = -1, max = 0;
+
+            uint64_t counter = 0;
+            size_t n = 0;
+            for (size_t i = 0; i < N * SamplingFreq; ++i) {
+                if ((counter & (SamplingFreq - 1)) == 0)
+                    x = TimeTraits::get();
+                if ((counter & (SamplingFreq - 1)) == 0)
+                    y = TimeTraits::get();
+                if ((counter & (SamplingFreq - 1)) == 0) {
+                    total += y - x;
+                    min = std::min(min, y - x);
+                    max = std::max(max, y - x);
+                    ++n;
+                }
+                counter++;
+            }
+
+            return { min, double(total) / n, max };
+        }
+
+        uint64_t _counter;
         FrameData* _frame_data;
         typename TimeTraits::value_type _begin;
     };
 
     template< typename FrameData > double frame_registry<FrameData>::_trace_overhead = []() {
-        auto run = [](size_t n) {
-            for (size_t i = 0; i < n; ++i) {
-                static frame frame(__FUNCTION__);
-                frame_guard< ::trace::frame_data > trace_guard(&frame);
-            }
+        auto run = [](){
+            static frame frame(__FUNCTION__);
+            frame_guard< ::trace::frame_data > trace_guard(&frame);
         };
-
-        const size_t n = 100;
-        run(n);
-
-        auto begin = default_time_traits::get();
-        run(n);
-        auto end = default_time_traits::get();
         
+        run();
+        
+        auto [f, e] = differential_measure< default_time_traits >(run);
+        f /= default_time_traits::get_frequency();
         frame_registry<FrameData>::instance().clear();
-
-        return default_time_traits::diff(end, begin) / n;
+        return f;
     }();
     
     struct stream_dumper {
@@ -396,16 +488,17 @@ namespace trace {
             auto avg_time = double(data.time()) / data.exclusive_count() / 1e6;
             auto overhead_count = std::max(uint64_t(0), data.inclusive_count() - data.exclusive_count());
             auto overhead_time = frame_registry< frame_data >::instance().trace_overhead() * overhead_count;
-            auto cycles = uint64_t(data.time() * default_time_traits::get_frequency() / data.exclusive_count()) - default_time_traits::get_overhead();
-
+            auto cycles = frame_registry< frame_data >::instance().compensate_overhead(
+                frame_guard< frame_data >::get_overhead(), data.time() * default_time_traits::get_frequency() / data.exclusive_count());
+            
             _stream << "CALLTRACE: " << indent(level) << std::fixed << std::setprecision(6)
                 << data.short_name() << ": " << total_time
                 << "ms (" << avg_time << "ms/call, count=" << data.exclusive_count();
+            if (cycles < 10000) {
+                _stream << ", cycles=" << std::setprecision(2) << cycles;
+            }
             if (overhead_count) {
                 _stream << ", err=" << std::setprecision(2) << (overhead_time * 100) / data.time() << "%";
-            }
-            if (cycles < 10000) {
-                _stream << ", cycles=" << cycles;
             }
             _stream << ")" << std::endl;
         }
@@ -425,6 +518,10 @@ namespace trace {
 
 // TODO: 'static' here is important, as it allows us to use addresses of static variables
 // instead of EIP to distinguish stacks. It also is very intrusive.
-#define TRACE(...) \
-  static ::trace::frame _TRACE_NAME(_entry_frame_)(__VA_ARGS__); \
-  ::trace::frame_guard< ::trace::frame_data > _TRACE_NAME(_entry_)(&_TRACE_NAME(_entry_frame_))
+#if defined(TRACE_ENABLED)
+    #define TRACE(...) \
+      static ::trace::frame _TRACE_NAME(_entry_frame_)(__VA_ARGS__); \
+      ::trace::frame_guard< ::trace::frame_data > _TRACE_NAME(_entry_)(&_TRACE_NAME(_entry_frame_))
+#else
+    #define TRACE(...)
+#endif

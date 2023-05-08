@@ -336,3 +336,10 @@ TEST(time_test, test_counter_stats) {
     volatile size_t dummy;
     test_counter< trace::rdtscp_counter, Loops, trace::ratio<0>, trace::ratio<3,4> >([&](size_t n){ cycle(n, &dummy); });
 }
+
+TEST(time_test, test_histogram) {
+    trace::histogram histogram;
+    ASSERT_EQ(histogram.mean(), 0);
+    histogram.add(10, 10);
+    ASSERT_EQ(histogram.mean(), 10);
+}

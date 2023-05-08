@@ -6,10 +6,9 @@
 //
 
 // TODO: 
-// move sampling counter to the frame
-// convert to the time at the end
+// move sampling counter to the frame (not as easy as we will lose counts...)
 // inject frame_registry
-// get rid of time/count, use histogram
+// get rid of time/count, use histogram (?)
 
 #include <array>
 #include <mutex>
@@ -310,21 +309,24 @@ namespace trace {
         template< typename Begin = BeginRatio, typename End = EndRatio > double mean() const {
             auto data = values();
             double mean = 0;
+            size_t count = 0;
 
-            for (size_t i = Begin::value() * data.size(); i < End::value() * data.size(); ++i) {
+            for (size_t i = std::floor(Begin::value() * data.size()); i < std::ceil(End::value() * data.size()); ++i) {
                 mean += data[i];
+                count++;
             }
-            return mean / ((End::value() - Begin::value()) * data.size());
+            return count > 0 ? mean / count : 0;
         }
 
         template< typename Begin = BeginRatio, typename End = EndRatio > std::tuple< uint64_t, size_t > total() const {
             auto data = values();
-            uint64_t total = 0;
-
-            for (size_t i = Begin::value() * data.size(); i < End::value() * data.size(); ++i) {
+            double total = 0;
+            size_t count = 0;
+            for (size_t i = std::floor(Begin::value() * data.size()); i < std::ceil(End::value() * data.size()); ++i) {
                 total += data[i];
+                count++;
             }
-            return {total, (End::value() - Begin::value()) * data.size()};
+            return {total, count};
         }
 
     private:
@@ -338,7 +340,7 @@ namespace trace {
             return value - avg;
         if (value > min)
             return value - min;
-        return NAN;
+        return 0;
     }
 
     struct frame {
@@ -483,7 +485,7 @@ namespace trace {
         }
 
         std::vector< FrameData* > sort_tree(std::map< std::string, FrameData >& records) const {
-            auto compare = [&](const FrameData* lhs, const FrameData* rhs) { return lhs->time() > rhs->time(); };
+            auto compare = [&](const FrameData* lhs, const FrameData* rhs) { return lhs->value() > rhs->value(); };
             std::vector< FrameData* > result;
             for (auto& [key, data] : records) {
                 data.sort_children(compare);
@@ -522,12 +524,12 @@ namespace trace {
         const std::string& long_name() const { return _long_name; }
         const std::string& short_name() const { return _short_name; }
 
-        void add_time(uint64_t value, uint64_t count) {
-            _time += value * count;
+        void add_value(uint64_t value, uint64_t count) {
+            _value += value * count;
             _count += count;
             _histogram.add(value, count);
         }
-        uint64_t time() const { return _time; }
+        uint64_t value() const { return _value; }
 
         uint64_t exclusive_count() const { return _count; }
 
@@ -538,7 +540,7 @@ namespace trace {
         }
 
         void merge(const frame_data& other) {
-            _time += other._time;
+            _value += other._value;
             _count += other._count;
             _histogram.merge(other._histogram);
         }
@@ -553,8 +555,6 @@ namespace trace {
             return elapsed;
         }
 
-        //auto compensation() const { return _histogram.compensation(); }
-
     private:
         // TODO: this does not belong here
         const frame_data* _parent {};
@@ -562,7 +562,7 @@ namespace trace {
         std::string _long_name;
         std::string _short_name;
 
-        uint64_t _time = 0;
+        uint64_t _value = 0;
         uint64_t _count = 0;
         uint64_t _sampling_counter[2] = {0};
     public:
@@ -580,7 +580,8 @@ namespace trace {
         ~frame_guard() {
             if ((_counter & (SamplingFreq - 1)) == 0) {
                 auto end = TimeTraits::end();
-                _frame_data->add_time(TimeTraits::diff(end, _begin), _frame_data->reset_sampling_counter());
+                if (end > _begin)
+                    _frame_data->add_value(end - _begin, _frame_data->reset_sampling_counter());
             }
             frame_registry< FrameData >::instance().pop_frame();
         }
@@ -635,7 +636,6 @@ namespace trace {
         run();
         
         auto [f, e] = differential_measure< default_time_traits >(run);
-        f /= default_time_traits::get_frequency();
         frame_registry<FrameData>::instance().clear();
         return f;
     }();
@@ -644,22 +644,22 @@ namespace trace {
         stream_dumper(std::ostream& stream, double scale = 1): _stream(stream), _scale(scale) {}
 
         void operator () (const frame_data& data, size_t level) {
-            auto total_time = double(data.time()) * _scale / 1e6;
-            auto avg_time = double(data.time()) / data.exclusive_count() / 1e6;
+            auto time_total = double(data.value()) * _scale / default_time_traits::get_frequency() / 1e6;
+            auto time_avg = time_total / data.exclusive_count();
             auto overhead_count = std::max(uint64_t(0), data.inclusive_count() - data.exclusive_count());
-            auto overhead_time = frame_registry< frame_data >::instance().trace_overhead() * overhead_count;
-            auto cycles = data.time() * default_time_traits::get_frequency() / data.inclusive_count();
-            auto mean = data._histogram.mean() * default_time_traits::get_frequency();
-            auto cycles_compensated = trace::compensate(frame_guard< frame_data >::get_overhead(), mean);
+            auto overhead_cycles = frame_registry< frame_data >::instance().trace_overhead() * overhead_count;
+            auto cycles_raw = data.value() / data.exclusive_count();
+            auto cycles_mean = data._histogram.mean();
+            auto cycles_compensated = trace::compensate(frame_guard< frame_data >::get_overhead(), cycles_mean);
 
             _stream << "CALLTRACE: " << indent(level) << std::fixed << std::setprecision(6)
-                << data.short_name() << ": " << total_time
-                << "ms (" << avg_time << "ms/call, count=" << data.exclusive_count();
-            if (cycles < 10000) {
-                _stream << ", cycles=" << std::setprecision(2) << cycles << ", compensated=" << cycles_compensated << ", mean=" << mean;
+                << data.short_name() << ": " << time_total
+                << "ms (" << time_avg << "ms/call, count=" << data.exclusive_count();
+            if (cycles_raw < 1000) {
+                _stream << ", cycles(raw=" << std::setprecision(2) << cycles_raw << ", mean=" << cycles_mean << ", est=" << cycles_compensated << ")";
             }
             if (overhead_count) {
-                _stream << ", err=" << std::setprecision(2) << (overhead_time * 100) / data.time() << "%";
+                _stream << ", err=" << std::setprecision(2) << (overhead_cycles * 100) / data.value() << "%";
             }
             _stream << ")" << std::endl;
         }

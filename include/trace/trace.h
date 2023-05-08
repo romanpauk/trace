@@ -5,6 +5,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 
+// TODO: 
+// move sampling counter to the frame
+// convert to the time at the end
+// inject frame_registry
+// get rid of time/count, use histogram
+
 #include <array>
 #include <mutex>
 #include <unordered_map>
@@ -12,9 +18,12 @@
 #include <memory>
 #include <deque>
 #include <algorithm>
+#include <vector>
 #include <iomanip>
 #include <thread>
 #include <chrono>
+#include <iostream>
+#include <cmath>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -32,17 +41,31 @@
 #define TRACE_ENABLED
 
 namespace trace {
+    template< size_t N, size_t D = 1 > struct ratio
+    {
+        static_assert(D >= N);
+        static constexpr double value() { return double(N) / D; }
+    };
+
+    using BeginRatio = ratio<0>;
+    using EndRatio = ratio<3, 4>;
 
 #if defined(__linux__)
     template< clockid_t id > struct clock_gettime_time_traits {
         using value_type = timespec;
+
+        static value_type begin() { return get(); }
+        static value_type end() { return get(); }
+
+        static double diff(const value_type& end, const value_type& begin) {
+            uint64_t value = (end.tv_sec - begin.tv_sec) * 1e9 + (end.tv_nsec - begin.tv_nsec);
+            return value;
+        }
+
+    private:
         static value_type get() {
             value_type value;
             clock_gettime(id, &value);
-            return value;
-        }
-        static double diff(const value_type& end, const value_type& begin) {
-            uint64_t value = (end.tv_sec - begin.tv_sec) * 1e9 + (end.tv_nsec - begin.tv_nsec);
             return value;
         }
     };
@@ -51,11 +74,10 @@ namespace trace {
 #if defined(_WIN32)
     struct qpc_time_traits {
         using value_type = LARGE_INTEGER;
-        static value_type get() {
-            value_type value;
-            QueryPerformanceCounter(&value);
-            return value;
-        }
+
+        static value_type begin() { return get(); }
+        static value_type end() { return get(); }
+        
         static double diff(const value_type& end, const value_type& begin) {
             value_type elapsed;
             elapsed.QuadPart = end.QuadPart - begin.QuadPart;
@@ -65,6 +87,12 @@ namespace trace {
         }
 
     private:
+        static value_type get() {
+            value_type value;
+            QueryPerformanceCounter(&value);
+            return value;
+        }
+
         static const value_type& get_frequency() {
             static value_type freq = []() {
                 value_type value;
@@ -77,21 +105,42 @@ namespace trace {
 #endif
 
     // This assumes constant inviarant TSC
-    template< typename CTraits > struct rdtsc_time_traits {
+    // With mfence, the counter has fixed cost that can be substracted from TRACE().
+    struct rdtscp_counter {
         using value_type = uint64_t;
 
+        static value_type begin() { return get(); }
+        static value_type end() { return get(); }
+
+    private:
         static value_type get() {
+            unsigned dummy;
+            _mm_mfence();
+            auto res = __rdtscp(&dummy);
+            _mm_lfence();
+            return res;
+        }
+    };
+
+    struct rdtsc_counter {
+        using value_type = uint64_t;
+
+        static value_type begin() { return get(); }
+        static value_type end() { return get(); }
+
+    private:
+        static value_type get() {
+            _mm_mfence();
             _mm_lfence();
             auto res = __rdtsc();
             _mm_lfence();
             return res;
-
-            //unsigned dummy;
-            //auto res = __rdtscp(&dummy);
-            //_mm_lfence();
-            //return res;
         }
+    };
 
+    template< typename CTraits > struct tsc_time_traits: rdtscp_counter {
+        using value_type = uint64_t;
+ 
         static double diff(const value_type& end, const value_type& begin) {
             return double(end - begin) / get_frequency();
         }
@@ -108,87 +157,188 @@ namespace trace {
         
     private:
         static double calculate_frequency() {
-            double freq = 0;
-            const int N = 100;
-            unsigned dummy;
-            volatile uint64_t dummyval;
-
+            const int N = 1024;
+            std::array< double, N > data;
             for (size_t i = 0; i < N; ++i) {
-                auto cstart = CTraits::get();
-                auto start = get();
-	            for(size_t i = 0; i < 100000; ++i)
-                    dummyval = __rdtscp(&dummy);
-                auto stop = get();
-                auto cstop = CTraits::get();
-                freq += double(stop - start) / CTraits::diff(cstop, cstart);
+                auto cstart = CTraits::begin();
+                auto start = begin();
+                for(size_t i = 0; i < 1024 * 32; ++i)
+                    _mm_pause();
+                auto stop = end();
+                auto cstop = CTraits::end();
+                data[i] = double(stop - start) / CTraits::diff(cstop, cstart);
             }
 
-            return freq / N;
+            std::sort(data.begin(), data.end(), [](auto lhs, auto rhs) { return lhs < rhs; });
+            
+            double total = 0;
+            for (size_t i = BeginRatio::value() * N; i < EndRatio::value() * N; ++i) {
+                total += data[i];
+            }
+
+            return total / ((EndRatio::value() - BeginRatio::value()) * N);
         }
 
         static std::tuple< uint64_t, double, uint64_t > calculate_overhead() {
-            const int N = 1000;
-            uint64_t x = 0, y = 0, total = 0, min = -1, max = 0;
+            const int N = 1024*16;
+            uint64_t x = 0, y = 0;
 
             uint64_t counter = 0;
+            std::vector< uint64_t > data(N);
             for (size_t i = 0; i < N; ++i) {
-                x = get();
-                y = get();
-                total += y - x;
-                min = std::min(min, y - x);
-                max = std::max(max, y - x);
+                x = begin();
+                y = end();
+                data[i] = y - x;
             }
 
-            return { min, double(total) / N, max };
+            std::sort(data.begin(), data.end(), [](uint64_t lhs, uint64_t rhs) { return lhs < rhs; });
+
+            uint64_t total = 0;
+            for (size_t i = BeginRatio::value() * N; i < EndRatio::value() * N; ++i) {
+                total += data[i];
+            }
+
+            uint64_t min = data[BeginRatio::value() * N];
+            uint64_t max = data[EndRatio::value() * N - 1];
+            return { min, double(total) / ((EndRatio::value() - BeginRatio::value()) * N), max };
         }
     };
 
 #if defined(_WIN32)
-    using default_time_traits = rdtsc_time_traits< qpc_time_traits >;
+    using default_time_traits = tsc_time_traits< qpc_time_traits >;
 #elif defined(__linux__)
-    using default_time_traits = rdtsc_time_traits< clock_gettime_time_traits< CLOCK_MONOTONIC > >;
+    using default_time_traits = tsc_time_traits< clock_gettime_time_traits< CLOCK_MONOTONIC > >;
 #else
     #error "don't know how to measure"
 #endif
-
+    
     // See: Accurate Measurement of Small Execution Times
     // https://uwaterloo.ca/embedded-software-group/sites/ca.embedded-software-group/files/uploads/files/ieee-esl-precise-measurements.pdf
-    template < typename TimeTraits, typename Fn > std::tuple< double, double > differential_measure(const Fn& fn) {
+    template < typename TimeTraits, typename Begin = BeginRatio, typename End = EndRatio, typename Fn > std::tuple< double, double > differential_measure(const Fn& fn) {
         // T1 = N1F + e
         // T2 = N2F + e
         // F = (T2-T1)/(N2-N1)
         // e = (N1T2-N2T1)/(N1-N2)
 
-        const int N = 10000;
+        const int N = 1024*64;
+        std::vector< std::array< double, 2 > > data(N);
 
         int64_t begin, end, t1, t2, n1 = 1, n2 = 10;
-        double f = 0, e = 0;
-
+        
         for (size_t i = 0; i < N; ++i) {
-            begin = TimeTraits::get();
+        again:
+            begin = TimeTraits::begin();
             fn();
-            end = TimeTraits::get();
+            end = TimeTraits::end();
             t1 = end - begin;
 
-            begin = TimeTraits::get();
-            fn();
-            fn();
-            fn();
-            fn();
-            fn();
-            fn();
-            fn();
-            fn();
-            fn();
-            fn();
-            end = TimeTraits::get();
+            begin = TimeTraits::begin();
+            for(size_t i = 0; i < n2; ++i)
+                fn();
+            end = TimeTraits::end();
             t2 = end - begin;
+            if (t2 < t1)
+                goto again;
 
-            e += double(n1 * t2 - n2 * t1) / (n1 - n2);
-            f += double(t2 - t1) / (n2 - n1);
+            data[i][0] = double(t2 - t1) / (n2 - n1);
+            data[i][1] = double(n1 * t2 - n2 * t1) / (n1 - n2);
         }
 
-        return { f / N, e / N };
+        std::sort(data.begin(), data.end(), 
+            [](const std::array< double, 2 >& lhs, const std::array< double, 2 >& rhs) {
+            return lhs[0] < rhs[0];
+        });
+
+        double e = 0, f = 0;
+        for (size_t i = Begin::value() * N; i < End::value() * N; ++i) {
+            f += data[i][0];
+            e += data[i][1];
+        }
+        return { f / ((End::value() - Begin::value()) * N), e / ((End::value() - Begin::value()) * N) };
+    }
+
+    struct histogram {
+        struct bin {
+            uint64_t total;
+            uint64_t count;
+
+            void merge(const bin& other) {
+                total += other.total;
+                count += other.count;
+            }
+        };
+
+        size_t index(uint64_t value) {
+        #if defined(_WIN32)
+            auto lz = __lzcnt64(value);
+        #else
+            auto lz =  __builtin_clzll(value);
+        #endif
+            return (sizeof(value) * 8 - 1) - lz;
+        }
+
+        void add(uint64_t value, size_t count){
+            auto i = index(value);
+            _data[i].total += value * count;
+            _data[i].count += count;
+        }
+
+        void merge(const histogram& other) {
+            for (size_t i = 0; i < _data.size(); ++i)
+                _data[i].merge(other._data[i]);
+        }
+
+        std::vector< double > values() const {
+            size_t n = 0;
+            for (size_t i = 0; i < _data.size(); ++i) {
+                n += _data[i].count;
+            }
+            std::vector< double > data(n);
+            n = 0;
+            for (size_t i = 0; i < _data.size(); ++i) {
+                if (!_data[i].count)
+                    continue;
+
+                auto mean = double(_data[i].total) / _data[i].count;
+                for (size_t j = 0; j < _data[i].count; ++j) {
+                    data[n++] = mean;
+                }
+            }
+            return data;
+        }
+
+        template< typename Begin = BeginRatio, typename End = EndRatio > double mean() const {
+            auto data = values();
+            double mean = 0;
+
+            for (size_t i = Begin::value() * data.size(); i < End::value() * data.size(); ++i) {
+                mean += data[i];
+            }
+            return mean / ((End::value() - Begin::value()) * data.size());
+        }
+
+        template< typename Begin = BeginRatio, typename End = EndRatio > std::tuple< uint64_t, size_t > total() const {
+            auto data = values();
+            uint64_t total = 0;
+
+            for (size_t i = Begin::value() * data.size(); i < End::value() * data.size(); ++i) {
+                total += data[i];
+            }
+            return {total, (End::value() - Begin::value()) * data.size()};
+        }
+
+    private:
+        std::array< bin, sizeof(uint64_t) * 8 > _data{};
+    };
+
+    inline double compensate(const std::tuple< uint64_t, double, uint64_t >& overhead, double value) {
+        // TODO: the compensation is crude
+        const auto& [min, avg, max] = overhead;
+        if (value > avg)
+            return value - avg;
+        if (value > min)
+            return value - min;
+        return NAN;
     }
 
     struct frame {
@@ -267,12 +417,6 @@ namespace trace {
         }
 
         double trace_overhead() { return _trace_overhead; }
-
-        static double compensate_overhead(const std::tuple< uint64_t, double, uint64_t >& overhead, double value) {
-            // TODO: the compensation is crude
-            const auto& [min, avg, max] = overhead;
-            return value > avg ? value - avg : value - min;
-        }
 
     private:
         static std::string get_frame_name(const frame_stack& stack) {
@@ -378,7 +522,11 @@ namespace trace {
         const std::string& long_name() const { return _long_name; }
         const std::string& short_name() const { return _short_name; }
 
-        void add_time(uint64_t value, uint64_t count) { _time += value * count; _count += count; }
+        void add_time(uint64_t value, uint64_t count) {
+            _time += value * count;
+            _count += count;
+            _histogram.add(value, count);
+        }
         uint64_t time() const { return _time; }
 
         uint64_t exclusive_count() const { return _count; }
@@ -392,6 +540,7 @@ namespace trace {
         void merge(const frame_data& other) {
             _time += other._time;
             _count += other._count;
+            _histogram.merge(other._histogram);
         }
 
         uint64_t increment_sampling_counter() {
@@ -404,6 +553,8 @@ namespace trace {
             return elapsed;
         }
 
+        //auto compensation() const { return _histogram.compensation(); }
+
     private:
         // TODO: this does not belong here
         const frame_data* _parent {};
@@ -414,6 +565,8 @@ namespace trace {
         uint64_t _time = 0;
         uint64_t _count = 0;
         uint64_t _sampling_counter[2] = {0};
+    public:
+        histogram _histogram;
     };
 
     template< typename FrameData, typename TimeTraits = default_time_traits, size_t SamplingFreq = 32 > struct frame_guard {
@@ -421,12 +574,12 @@ namespace trace {
             _frame_data = frame_registry< FrameData >::instance().push_frame(frame);
             _counter = _frame_data->increment_sampling_counter();
             if ((_counter & (SamplingFreq - 1)) == 0)
-                _begin = TimeTraits::get();
+                _begin = TimeTraits::begin();
         }
 
         ~frame_guard() {
             if ((_counter & (SamplingFreq - 1)) == 0) {
-                auto end = TimeTraits::get();
+                auto end = TimeTraits::end();
                 _frame_data->add_time(TimeTraits::diff(end, _begin), _frame_data->reset_sampling_counter());
             }
             frame_registry< FrameData >::instance().pop_frame();
@@ -439,26 +592,33 @@ namespace trace {
 
     private:
         static std::tuple< uint64_t, double, uint64_t > calculate_overhead() {
-            const int N = 1000;
-            uint64_t x = 0, y = 0, total = 0, min = -1, max = 0;
+            const int N = 1024*16;
+            uint64_t x = 0, y = 0;
 
             uint64_t counter = 0;
             size_t n = 0;
+            std::vector< uint64_t > data(N);
             for (size_t i = 0; i < N * SamplingFreq; ++i) {
                 if ((counter & (SamplingFreq - 1)) == 0)
-                    x = TimeTraits::get();
+                    x = TimeTraits::begin();
                 if ((counter & (SamplingFreq - 1)) == 0)
-                    y = TimeTraits::get();
+                    y = TimeTraits::end();
                 if ((counter & (SamplingFreq - 1)) == 0) {
-                    total += y - x;
-                    min = std::min(min, y - x);
-                    max = std::max(max, y - x);
-                    ++n;
+                    data[n++] = y - x;
                 }
                 counter++;
             }
 
-            return { min, double(total) / n, max };
+            std::sort(data.begin(), data.end(), [](uint64_t lhs, uint64_t rhs) { return lhs < rhs; });
+
+            uint64_t total = 0;
+            for(size_t i = N / 4; i < 3 * N / 4; ++i) {
+                total += data[i];
+            }
+
+            uint64_t min = data[N/4];
+            uint64_t max = data[3*N/4];
+            return { min, double(total) / (n / 2), max };
         }
 
         uint64_t _counter;
@@ -488,14 +648,15 @@ namespace trace {
             auto avg_time = double(data.time()) / data.exclusive_count() / 1e6;
             auto overhead_count = std::max(uint64_t(0), data.inclusive_count() - data.exclusive_count());
             auto overhead_time = frame_registry< frame_data >::instance().trace_overhead() * overhead_count;
-            auto cycles = frame_registry< frame_data >::instance().compensate_overhead(
-                frame_guard< frame_data >::get_overhead(), data.time() * default_time_traits::get_frequency() / data.exclusive_count());
-            
+            auto cycles = data.time() * default_time_traits::get_frequency() / data.inclusive_count();
+            auto mean = data._histogram.mean() * default_time_traits::get_frequency();
+            auto cycles_compensated = trace::compensate(frame_guard< frame_data >::get_overhead(), mean);
+
             _stream << "CALLTRACE: " << indent(level) << std::fixed << std::setprecision(6)
                 << data.short_name() << ": " << total_time
                 << "ms (" << avg_time << "ms/call, count=" << data.exclusive_count();
             if (cycles < 10000) {
-                _stream << ", cycles=" << std::setprecision(2) << cycles;
+                _stream << ", cycles=" << std::setprecision(2) << cycles << ", compensated=" << cycles_compensated << ", mean=" << mean;
             }
             if (overhead_count) {
                 _stream << ", err=" << std::setprecision(2) << (overhead_time * 100) / data.time() << "%";

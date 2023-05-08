@@ -10,6 +10,7 @@
 #include <trace/trace.h>
 
 #include <iostream>
+#include <cmath>
 
 static void fn()
 {
@@ -92,17 +93,23 @@ TEST(trace_test, test_sleep_100) {
 
 TEST(time_test, test_time_traits_sleep) {
     using Traits = trace::default_time_traits;
-    auto begin = Traits::get();
+    auto begin = Traits::begin();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    auto end = Traits::get();
+    auto end = Traits::end();
     std::cerr << Traits::diff(end, begin) << std::endl;
+}
+
+void cycle(size_t n, volatile size_t* dummy, size_t loads = 1) {
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < loads; ++j)
+            (*dummy)++;
+    }
 }
 
 TEST(time_test, test_overhead_base) {
     trace::frame_registry< trace::frame_data >::instance().clear();
     using Traits = trace::default_time_traits;
 
-    auto begin = Traits::get();
     {
         TRACE(__FUNCTION__);
 
@@ -110,6 +117,13 @@ TEST(time_test, test_overhead_base) {
 
         {
             for (size_t i = 0; i < N; ++i) {
+            }
+        }
+
+        {
+            volatile size_t dummy;            
+            for(size_t i = 0; i < N; ++i) {
+                cycle(10, &dummy);
             }
         }
 
@@ -145,7 +159,6 @@ TEST(time_test, test_overhead) {
     trace::frame_registry< trace::frame_data >::instance().clear();
     using Traits = trace::default_time_traits;
 
-    auto begin = Traits::get();
     {
         TRACE(__FUNCTION__);
 
@@ -155,6 +168,15 @@ TEST(time_test, test_overhead) {
             TRACE("empty");
             for (size_t i = 0; i < N; ++i) {
                 TRACE("emptyloop");
+            }
+        }
+
+        {
+            TRACE("cycle10");
+            volatile size_t dummy;            
+            for(size_t i = 0; i < N; ++i) {
+                TRACE("cycleloop");
+                cycle(10, &dummy);
             }
         }
 
@@ -201,23 +223,16 @@ TEST(time_test, test_differential_measure_base) {
     int64_t begin, end, t1, t2, n1 = 1, n2 = 10, e = 0, f = 0;
 
     for (size_t i = 0; i < N; ++i) {
-        begin = Traits::get();
-        dummy = Traits::get();
-        end = Traits::get();
+        begin = Traits::begin();
+        cycle(1, &dummy);
+        end = Traits::end();
         t1 = end - begin;
 
-        begin = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        dummy = Traits::get();
-        end = Traits::get();
+        begin = Traits::begin();
+        for (size_t i = 0; i < n2; ++i) {
+            cycle(1, &dummy);
+        }
+        end = Traits::end();
         t2 = end - begin;
 
         e += double(n1*t2-n2*t1)/(n1-n2);
@@ -229,44 +244,95 @@ TEST(time_test, test_differential_measure_base) {
 
 TEST(time_test, test_differential_measure_lambda) {
     using Traits = trace::default_time_traits;
-    auto [f, e] = trace::differential_measure< Traits >([] { volatile uint64_t dummy = Traits::get(); });
+    volatile uint64_t dummy;
+    auto [f, e] = trace::differential_measure< Traits >([&] {
+        cycle(1, &dummy);
+    });
     std::cerr << "f: " << f << ", e: " << e << std::endl;
 }
 
-template< typename Fn > void measure(const char* name, Fn&& fn) {
+template< typename Traits, typename Fn > void measure(Fn&& fn) {
     trace::frame_registry< trace::frame_data >::instance().clear();
-    using Traits = trace::default_time_traits;
-
+    
     fn();
 
     auto [f, e] = trace::differential_measure< Traits >(fn);
-    std::cerr << name << ": differential measure: " << f << std::endl;
+    std::cerr << typeid(Traits).name() << ": differential_measure: " << f + e << ", error=" << e << ", result=" << f << std::endl;
 
     for (size_t i = 0; i < 100000; ++i)
     {
-        TRACE(name);
+        TRACE("<dummy>");
         fn();
     }
 
     trace::frame_registry< trace::frame_data >::instance().for_each(trace::stream_dumper(std::cerr));
+    trace::frame_registry< trace::frame_data >::instance().clear();
 }
 
-TEST(time_test, test_timings) {
-    measure("_mm_pause()", [] { _mm_pause(); });
-    measure("_mm_lfence()", [] { _mm_lfence(); });
-    measure("_mm_mfence()", [] { _mm_mfence(); });
-    measure("_mm_sfence()", [] { _mm_sfence(); });
-    //measure("__rdtsc()", [] { volatile uint64_t dummy = __rdtsc(); });
-    //measure("__rdtscp()", [] { unsigned id; volatile uint64_t dummy = __rdtscp(&id); });
-    measure("default_time_traits::get()", [] { volatile uint64_t dummy = trace::default_time_traits::get(); });
+TEST(time_test, test_cycle_timings) {
+    size_t dummy;
+    for (size_t i = 0; i < 0; ++i) {
+        std::cerr << "CYCLE " << i << std::endl;
+        measure< trace::rdtscp_counter >([&] { cycle(i, &dummy); });
+    }
+}
 
-#if defined(_WIN32)
-    measure("qpc_time_traits::get()", [] { volatile auto value = trace::qpc_time_traits::get(); });
-#endif
+uint64_t variance(uint64_t* inputs, size_t start, size_t end) {
+    uint64_t mean = 0;
+    for (size_t i = start; i < end; ++i) {
+        mean += inputs[i];
+    }
+    mean /= end - start;
 
-#if defined(__linux__)
-    measure("clock_gettime_time_traits< CLOCK_MONOTONIC >::get()", [] { volatile auto value = trace::clock_gettime_time_traits< CLOCK_MONOTONIC >::get(); });
-    measure("clock_gettime_time_traits< CLOCK_THREAD_CPUTIME_ID >::get()", [] { volatile auto value = trace::clock_gettime_time_traits< CLOCK_THREAD_CPUTIME_ID >::get(); });
-#endif
-    
+    uint64_t var = 0;
+    for (size_t i = start; i < end; ++i) {
+        var += (inputs[i] - mean) * (inputs[i] - mean);
+    }
+
+    var /= end - start;
+    return var;
+}
+
+// How to Benchmark Code Execution Times on Intel IA-32 and IA-64 Instruction Set Architectures
+// https://www.intel.com/content/dam/www/public/us/en/documents/white-papers/ia-32-ia-64-benchmark-code-execution-paper.pdf
+template< typename Counter, size_t Loops = 1000, typename Begin, typename End, size_t N = 100, typename Fn > void test_counter(Fn fn) {
+    std::vector< std::array< uint64_t, N > > times(Loops);
+    std::array< uint64_t, N > variances;
+
+    auto overhead = trace::default_time_traits::get_overhead();
+
+    for (size_t n = 0; n < Loops; ++n) {
+        for (size_t i = 0; i < N; ++i) {
+            auto start = Counter::begin();
+            fn(n);
+            auto end = Counter::end();
+
+            times[n][i] = end - start;
+        }
+
+        std::sort(times[n].begin(), times[n].end(), [](auto lhs, auto rhs){ return lhs < rhs; });
+        
+        uint64_t min_time = -1, max_time = 0, var, max_dev, mean = 0, sd;
+        for (size_t i = Begin::value() * N; i < End::value() * N; ++i) {
+            min_time = std::min(times[n][i], min_time);
+            max_time = std::max(times[n][i], max_time);
+            mean += times[n][i];
+        }
+        mean /= N*(End::value() - Begin::value());
+        max_dev = max_time - min_time;
+        var = variance(times[n].data(), Begin::value()*N, End::value()*N);
+        sd = sqrt(var);
+        variances[n] = var;
+
+        auto [f, e] = trace::differential_measure< Counter, Begin, End >([&](){ fn(n); });
+
+        std::cerr << typeid(Counter).name() << ": N=" << n << ": mean=" << mean << ", var=" << var << ", sd=" << sd << ", min=" << min_time << ", max=" << max_time
+            << ", F=" << f << ", e=" << e << ", [F]=" << trace::compensate(overhead, mean) << ", diff=" << trace::compensate(overhead, mean) - f << "]" << std::endl;
+    }
+}
+
+TEST(time_test, test_counter_stats) {
+    const int Loops = 32;
+    volatile size_t dummy;
+    test_counter< trace::rdtscp_counter, Loops, trace::ratio<0>, trace::ratio<3,4> >([&](size_t n){ cycle(n, &dummy); });
 }

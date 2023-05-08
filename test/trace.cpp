@@ -121,7 +121,7 @@ TEST(time_test, test_overhead_base) {
         }
 
         {
-            volatile size_t dummy;            
+            volatile size_t dummy;
             for(size_t i = 0; i < N; ++i) {
                 cycle(10, &dummy);
             }
@@ -173,7 +173,7 @@ TEST(time_test, test_overhead) {
 
         {
             TRACE("cycle10");
-            volatile size_t dummy;            
+            volatile size_t dummy;
             for(size_t i = 0; i < N; ++i) {
                 TRACE("cycleloop");
                 cycle(10, &dummy);
@@ -265,13 +265,15 @@ template< typename Traits, typename Fn > void measure(Fn&& fn) {
         fn();
     }
 
+    // TODO: to extract frame data, we need to call merge() here, than sort(), than we need to calculate them.
+    // So, 1. there is missing model of the data, 2. there is a mess in the lifetime of the data.
     trace::frame_registry< trace::frame_data >::instance().for_each(trace::stream_dumper(std::cerr));
     trace::frame_registry< trace::frame_data >::instance().clear();
 }
 
 TEST(time_test, test_cycle_timings) {
     size_t dummy;
-    for (size_t i = 0; i < 0; ++i) {
+    for (size_t i = 0; i < 32; ++i) {
         std::cerr << "CYCLE " << i << std::endl;
         measure< trace::rdtscp_counter >([&] { cycle(i, &dummy); });
     }

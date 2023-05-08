@@ -389,8 +389,9 @@ namespace trace {
         static frame_registry< FrameData >& instance() { return _instance; }
             
         template< typename Fn > void for_each(Fn&& fn) const {
+            // TODO: this is really bad, sorted_records have pointers to records
             auto records = merge();
-            auto sorted_records = sort_tree(records);
+            auto sorted_records = sort(records);
             for_each(sorted_records, fn);
         }
 
@@ -481,10 +482,10 @@ namespace trace {
                 }
             }
             
-            return records;
+            return records; // This expects the move to happen
         }
 
-        std::vector< FrameData* > sort_tree(std::map< std::string, FrameData >& records) const {
+        std::vector< FrameData* > sort(std::map< std::string, FrameData >& records) const {
             auto compare = [&](const FrameData* lhs, const FrameData* rhs) { return lhs->value() > rhs->value(); };
             std::vector< FrameData* > result;
             for (auto& [key, data] : records) {

@@ -23,6 +23,7 @@
 #include <chrono>
 #include <iostream>
 #include <cmath>
+#include <map>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -40,8 +41,7 @@
 #define TRACE_ENABLED
 
 namespace trace {
-    template< size_t N, size_t D = 1 > struct ratio
-    {
+    template< size_t N, size_t D = 1 > struct ratio {
         static_assert(D >= N);
         static constexpr double value() { return double(N) / D; }
     };
@@ -222,7 +222,8 @@ namespace trace {
         const int N = 1024*64;
         std::vector< std::array< double, 2 > > data(N);
 
-        int64_t begin, end, t1, t2, n1 = 1, n2 = 10;
+        int64_t begin, end, t1, t2;
+        size_t n1 = 1, n2 = 10;
         
         for (size_t i = 0; i < N; ++i) {
         again:
@@ -318,17 +319,6 @@ namespace trace {
             return count > 0 ? mean / count : 0;
         }
 
-        template< typename Begin = BeginRatio, typename End = EndRatio > std::tuple< uint64_t, size_t > total() const {
-            auto data = values();
-            double total = 0;
-            size_t count = 0;
-            for (size_t i = std::floor(Begin::value() * data.size()); i < std::ceil(End::value() * data.size()); ++i) {
-                total += data[i];
-                count++;
-            }
-            return {total, count};
-        }
-
     private:
         std::array< bin, sizeof(uint64_t) * 8 > _data{};
     };
@@ -351,35 +341,117 @@ namespace trace {
         const char* _name;
     };
 
-    struct frame_stack {
-        struct hash {
-            size_t operator()(const frame_stack& stack) const noexcept {
-                size_t hval = 0;
-                for (size_t i = 0; i < stack.addresses.size(); ++i)
-                    hval ^= reinterpret_cast<uintptr_t>(stack.addresses[i]);
-                return hval;
+    template< typename FrameData > struct frame_tree;
+
+    template< typename Value, size_t N > struct frame_tree_cache {
+        Value* get(const frame* frame) {
+            for (size_t i = 0; i < _frames.size(); ++i) {
+                if (_frames[i] == frame) return _values[i];
             }
-        };
+            return nullptr;
+        }
 
-        bool operator == (const frame_stack& other) const { return addresses == other.addresses; }
-        bool operator < (const frame_stack& other) const { return addresses < other.addresses; }
+        void put(const frame* frame, Value* value) {
+            auto index = _index++ & (N - 1);
+            _frames[index] = frame;
+            _values[index] = value;
+        }
 
-        std::deque< const frame* > addresses;
+        void clear() {
+            for (size_t i = 0; i < _frames.size(); ++i) {
+                _frames[i] = nullptr;
+                _values[i] = nullptr;
+            }
+            _index = 0;
+        }
+
+        std::array< const frame*, N > _frames {};
+        std::array< Value*, N > _values {};
+        size_t _index {};
     };
-    
+
+    // This is 10% faster than std::deque<>
+    template< typename T, size_t MaxSize > struct array_stack {
+        void push_back(const T& value) { _values[_size++] = value; }
+        void pop_back() { --_size; }
+        const T& back() { return _values[_size - 1]; }
+        size_t size() const { return _size; }
+        const T& operator[](size_t n) const { return _values[n]; }
+
+    private:
+        std::array< T, MaxSize > _values;
+        size_t _size{};
+    };
+
+    template< typename FrameData > struct frame_tree {
+        frame_tree()
+            : _frame()
+            , _parent()
+        {}
+
+        frame_tree(const frame_tree< FrameData >* parent, const frame* frame, FrameData&& data)
+            : _parent(parent)
+            , _frame(frame)
+            , _data(std::move(data))
+        {}
+
+        void clear() {
+            _children.clear();
+            _cache.clear();
+        }
+
+        const std::unordered_map< const frame*, std::unique_ptr< frame_tree< FrameData > > >& children() const { return _children; }
+        FrameData* data() { return &_data; }
+        const FrameData* data() const { return &_data; }
+
+        template< size_t N > frame_tree< FrameData >* get(const frame* frame, const array_stack< frame_tree< FrameData >*, N >& stack) {
+            frame_tree< FrameData >* frame_data = _cache.get(frame);
+            if (frame_data)
+                return frame_data;
+
+            auto it = _children.find(frame);
+            if (it == _children.end()) {
+                it = _children.emplace(frame,
+                    new frame_tree< FrameData >(this, frame,
+                        FrameData(&_data, get_long_name(stack, frame->name()), frame->name()))).first;
+            }
+
+            frame_data = it->second.get();
+            _cache.put(frame, frame_data);
+            return frame_data;
+        }
+
+    private:
+        template< size_t N > static std::string get_long_name(const array_stack< frame_tree< FrameData >*, N >& stack, const std::string& name) {
+            std::stringstream stream;
+            for (size_t i = 1; i < stack.size(); ++i) {
+                stream << '/' << stack[i]->_frame->name();
+            }
+            if (stack.size() > 1)
+                stream << '/';
+            stream << name;
+            return stream.str();
+        }
+
+        const frame* _frame;
+        const frame_tree< FrameData >* _parent;
+        frame_tree_cache< frame_tree< FrameData >, 8 > _cache;
+        std::unordered_map< const frame*, std::unique_ptr< frame_tree< FrameData > > > _children;
+        FrameData _data;
+    };
+
     template< typename FrameData > struct frame_registry {
     private:
-        using frame_records = std::unordered_map< frame_stack, FrameData, frame_stack::hash >;
-        
         struct thread_data {
-            thread_data(frame_records* records) : records(records) {}
-
-            frame_stack stack;
-            frame_records* records;
+            thread_data(frame_tree< FrameData >* root) {
+                stack.push_back(root);
+            }
+            
+            array_stack< frame_tree< FrameData >*, 1024 > stack;
         };
 
         mutable std::mutex _mutex;
-        std::vector< std::unique_ptr< frame_records > > _records;
+        std::vector< std::unique_ptr< frame_tree< FrameData > > > _frames;
 
         static frame_registry< FrameData > _instance;
         static thread_local thread_data _thread_data;
@@ -392,7 +464,7 @@ namespace trace {
             // TODO: this is really bad, sorted_records have pointers to records
             auto records = merge();
             auto sorted_records = sort(records);
-            for_each(sorted_records, fn);
+            for_each(sorted_records[0]->children(), fn); // TODO
         }
 
         template< typename Fn > void for_each(const std::vector< FrameData* >& frames, Fn&& fn, size_t level = 0) const {
@@ -403,74 +475,49 @@ namespace trace {
         }
 
         FrameData* push_frame(const frame* frame) {
-            auto& thread_data = _thread_data;
-            thread_data.stack.addresses.push_back(frame);
-            return get_frame_data(thread_data, thread_data.stack);
+            auto tree = _thread_data.stack.back()->get(frame, _thread_data.stack);
+            _thread_data.stack.push_back(tree);
+            return tree->data();
         }
 
         void pop_frame() {
-            auto& thread_data = _thread_data;
-            thread_data.stack.addresses.pop_back();
+            _thread_data.stack.pop_back();
         }
 
         void clear() {
-            for (auto& record : _records) {
-                record->clear();
+            for (auto& frame : _frames) {
+                frame->clear();
             }
         }
 
         double trace_overhead() { return _trace_overhead; }
 
     private:
-        static std::string get_frame_name(const frame_stack& stack) {
-            std::stringstream stream;
-            stream << stack.addresses[0]->name();
-            for(size_t i = 1; i < stack.addresses.size(); ++i) {
-                stream << '/' << stack.addresses[i]->name();
-            }
-            return stream.str();
-        }
-
-        FrameData* get_frame_data(thread_data& data, const frame_stack& stack) const {
-            FrameData* framedata = nullptr;
-            auto& records = *data.records;
-            auto it = records.find(stack);
-            if (it != records.end()) {
-                framedata = &it->second;
-            } else {
-                auto frame = stack.addresses.back();
-                framedata = &(records.emplace(stack,
-                    FrameData(get_parent_frame_data(data, stack), get_frame_name(stack), frame->name())).first->second);
-            }
-            return framedata;
-        }
-
-        FrameData* get_parent_frame_data(thread_data& data, const frame_stack& stack) const {
-            FrameData* parent_data = nullptr;
-            if (stack.addresses.size() > 1) {
-                auto parent_stack(stack);
-                parent_stack.addresses.pop_back();
-                parent_data = get_frame_data(data, parent_stack);
-            }
-            return parent_data;
-        }
-
-        frame_records* create_frame_records() {
+        frame_tree< FrameData >* create_frame() {
             std::lock_guard lock(_mutex);
-            _records.emplace_back(new frame_records);
-            return _records.back().get();
+            _frames.emplace_back(new frame_tree< FrameData >);
+            return _frames.back().get();
         }
-        
+
+        void merge(std::map< std::string, FrameData >& records, const frame_tree< FrameData >& tree, size_t level) const {
+            if (level > 0) {
+                auto data = tree.data();
+                auto& mergeddata = records.emplace(data->long_name(), FrameData(data->parent(), data->long_name(), data->short_name())).first->second;
+                mergeddata.merge(*data);
+            }
+
+            for (auto& [_, tree] : tree.children()) {
+                merge(records, *tree, level + 1);
+            }
+        }
+
         std::map< std::string, FrameData > merge() const {
             std::lock_guard lock(_mutex);
             std::map< std::string, FrameData > records;
 
             // Merge symbols together from different threads/callstacks
-            for (auto& record : _records) {
-                for (auto& [key, data] : *record) {
-                    auto& mergeddata = records.emplace(data.long_name(), FrameData(data.parent(), data.long_name(), data.short_name())).first->second;
-                    mergeddata.merge(data);
-                }
+            for (auto& frame : _frames) {
+                merge(records, *frame, 0);
             }
 
             // Create parent/child relationships according to merged symbols
@@ -482,7 +529,7 @@ namespace trace {
                 }
             }
             
-            return records; // This expects the move to happen
+            return records; // This expects the move to happen, is that guaranteed?
         }
 
         std::vector< FrameData* > sort(std::map< std::string, FrameData >& records) const {
@@ -502,7 +549,7 @@ namespace trace {
 
     template< typename FrameData > frame_registry<FrameData> frame_registry<FrameData>::_instance;
     template< typename FrameData > thread_local typename frame_registry<FrameData>::thread_data frame_registry<FrameData>::_thread_data(
-        frame_registry<FrameData>::instance().create_frame_records());
+        frame_registry<FrameData>::instance().create_frame());
 
     struct frame_data {
         frame_data() = default;
@@ -570,8 +617,8 @@ namespace trace {
         histogram _histogram;
     };
 
-    template< typename FrameData, typename TimeTraits = default_time_traits, size_t SamplingFreq = 32 > struct frame_guard {
-        frame_guard(frame* frame) {
+    template< typename FrameData, typename TimeTraits = default_time_traits, size_t SamplingFreq = 1 > struct frame_guard {
+        frame_guard(const frame* frame) {
             _frame_data = frame_registry< FrameData >::instance().push_frame(frame);
             _counter = _frame_data->increment_sampling_counter();
             if ((_counter & (SamplingFreq - 1)) == 0)
@@ -625,7 +672,7 @@ namespace trace {
 
         uint64_t _counter;
         FrameData* _frame_data;
-        typename TimeTraits::value_type _begin;
+        typename TimeTraits::value_type _begin {};
     };
 
     template< typename FrameData > double frame_registry<FrameData>::_trace_overhead = []() {

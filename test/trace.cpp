@@ -220,7 +220,8 @@ TEST(time_test, test_differential_measure_base) {
     const int N = 10000;
 
     volatile uint64_t dummy;
-    int64_t begin, end, t1, t2, n1 = 1, n2 = 10, e = 0, f = 0;
+    int64_t begin, end, t1, t2, e = 0, f = 0;
+    size_t n1 = 1, n2 = 10;
 
     for (size_t i = 0; i < N; ++i) {
         begin = Traits::begin();

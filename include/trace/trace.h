@@ -323,13 +323,13 @@ namespace trace {
         std::array< bin, sizeof(uint64_t) * 8 > _data{};
     };
 
-    inline double compensate(const std::tuple< uint64_t, double, uint64_t >& overhead, double value) {
+    inline double compensate(const std::tuple< uint64_t, double, uint64_t >& overhead, double value, size_t count) {
         // TODO: the compensation is crude
         const auto& [min, avg, max] = overhead;
-        if (value > avg)
-            return value - avg;
-        if (value > min)
-            return value - min;
+        if (value > avg * count)
+            return value - avg * count;
+        if (value > min * count)
+            return value - min * count;
         return 0;
     }
 
@@ -617,7 +617,7 @@ namespace trace {
         histogram _histogram;
     };
 
-    template< typename FrameData, typename TimeTraits = default_time_traits, size_t SamplingFreq = 1 > struct frame_guard {
+    template< typename FrameData, typename TimeTraits = default_time_traits, size_t SamplingFreq = 32 > struct frame_guard {
         frame_guard(const frame* frame) {
             _frame_data = frame_registry< FrameData >::instance().push_frame(frame);
             _counter = _frame_data->increment_sampling_counter();
@@ -692,13 +692,14 @@ namespace trace {
         stream_dumper(std::ostream& stream, double scale = 1): _stream(stream), _scale(scale) {}
 
         void operator () (const frame_data& data, size_t level) {
-            auto time_total = double(data.value()) * _scale / default_time_traits::get_frequency() / 1e6;
+            auto overhead = frame_guard< frame_data >::get_overhead();
+            auto time_total = trace::compensate(overhead, data.value(), data.exclusive_count()) * _scale / default_time_traits::get_frequency() / 1e6;
             auto time_avg = time_total / data.exclusive_count();
             auto overhead_count = std::max(uint64_t(0), data.inclusive_count() - data.exclusive_count());
             auto overhead_cycles = frame_registry< frame_data >::instance().trace_overhead() * overhead_count;
             auto cycles_raw = data.value() / data.exclusive_count();
             auto cycles_mean = data._histogram.mean();
-            auto cycles_compensated = trace::compensate(frame_guard< frame_data >::get_overhead(), cycles_mean);
+            auto cycles_compensated = trace::compensate(overhead, cycles_mean, 1);
 
             _stream << "CALLTRACE: " << indent(level) << std::fixed << std::setprecision(6)
                 << data.short_name() << ": " << time_total

@@ -330,7 +330,7 @@ template< typename Counter, size_t Loops = 1000, typename Begin, typename End, s
         auto [f, e] = trace::differential_measure< Counter, Begin, End >([&](){ fn(n); });
 
         std::cerr << typeid(Counter).name() << ": N=" << n << ": mean=" << mean << ", var=" << var << ", sd=" << sd << ", min=" << min_time << ", max=" << max_time
-            << ", F=" << f << ", e=" << e << ", [F]=" << trace::compensate(overhead, mean) << ", diff=" << trace::compensate(overhead, mean) - f << "]" << std::endl;
+            << ", F=" << f << ", e=" << e << ", [F]=" << trace::compensate(overhead, mean, 1) << ", diff=" << trace::compensate(overhead, mean, 1) - f << "]" << std::endl;
     }
 }
 

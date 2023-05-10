@@ -91,6 +91,11 @@ TEST(trace_test, test_sleep_100) {
     trace::frame_registry< trace::frame_data >::instance().for_each(trace::stream_dumper(std::cout));
 }
 
+TEST(trace_test, test_empty) {
+    trace::frame_registry< trace::frame_data >::instance().clear();
+    trace::frame_registry< trace::frame_data >::instance().for_each(trace::stream_dumper(std::cout));
+}
+
 TEST(time_test, test_time_traits_sleep) {
     using Traits = trace::default_time_traits;
     auto begin = Traits::begin();
@@ -197,6 +202,8 @@ TEST(time_test, test_overhead) {
                 __rdtscp(&dummy);
                 __rdtscp(&dummy);
             }
+
+            volatile int a = 1;
         }
 
         {

@@ -464,7 +464,8 @@ namespace trace {
             // TODO: this is really bad, sorted_records have pointers to records
             auto records = merge();
             auto sorted_records = sort(records);
-            for_each(sorted_records[0]->children(), fn); // TODO
+            if (!sorted_records.empty())
+                for_each(sorted_records[0]->children(), fn); // TODO
         }
 
         template< typename Fn > void for_each(const std::vector< FrameData* >& frames, Fn&& fn, size_t level = 0) const {
@@ -628,8 +629,9 @@ namespace trace {
         ~frame_guard() {
             if ((_counter & (SamplingFreq - 1)) == 0) {
                 auto end = TimeTraits::end();
+                auto elapsed = _frame_data->reset_sampling_counter();
                 if (end > _begin)
-                    _frame_data->add_value(end - _begin, _frame_data->reset_sampling_counter());
+                    _frame_data->add_value(end - _begin, elapsed);
             }
             frame_registry< FrameData >::instance().pop_frame();
         }

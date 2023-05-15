@@ -1,9 +1,9 @@
 #!/bin/bash
 
-CPUOFF=4,5
-CPUSPEC=4-5,10-11
-CPUSPEC_IRQ_OFF=1-3,6-9
-CPUSPEC_IRQ_ON=1-11
+CPUOFF=24,25,26,27,28,29,30,31
+CPUSPEC=8-15,24-31
+CPUSPEC_IRQ_OFF=0-7,16-31
+CPUSPEC_IRQ_ON=0-31
 
 CPUSET=/home/roman/projects/cpuset/cset
 
@@ -18,9 +18,20 @@ function cpu_online() {
     done
 }
 
-function cpu_boost_disable() {
-    if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
-        /bin/echo $1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+function cpu_boost() {
+    INTEL_PSTATE=/sys/devices/system/cpu/intel_pstate/no_turbo
+    CPUFREQ_BOOST=/sys/devices/system/cpu/cpufreq/boost
+
+    if [ -f $INTEL_PSTATE ]; then
+        if [ $1 -eq "1" ]; then
+            /bin/echo 0 > $INTEL_PSTATE
+        else
+            /bin/echo 1 > $INTEL_PSTATE
+        fi
+    fi
+    
+    if [ -f $CPUFREQ_BOOST ]; then
+        /bin/echo $1 > $CPUFREQ_BOOST
     fi
 }
 
@@ -36,7 +47,7 @@ function cleanup {
     $CPUSET shield --reset
     cpu_irq "$CPUSPEC_IRQ_ON"
     cpu_online 1
-    cpu_boost_disable 0
+    cpu_boost 1
     cpupower frequency-set -g powersave
 }
 
@@ -46,7 +57,7 @@ cpupower frequency-set -g performance
 $CPUSET shield --cpu $CPUSPEC -k on
 cpu_irq "$CPUSPEC_IRQ_OFF"
 cpu_online 0
-cpu_boost_disable 1
+cpu_boost 0
 
 $CPUSET shield --exec $@
 

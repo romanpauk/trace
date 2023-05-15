@@ -5,6 +5,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <gtest/gtest.h>
 
 #include <trace/trace.h>
@@ -18,10 +23,10 @@ static void fn()
 }
 
 TEST(trace_test, test_basic_numbers) {
-    std::cerr << "frequency: " << trace::default_time_traits::get_frequency() << std::endl;
+    std::cerr << "cpu frequency: " << trace::time_traits< trace::rdtscp_counter >::get_cpu_frequency() << std::endl;
 
     {
-        auto overhead = trace::default_time_traits::get_overhead();
+        auto overhead = trace::get_counter_overhead< trace::default_time_traits >();
         std::cerr << "default_time_traits::get() cycle overhead (min, avg, max): " << std::get< 0 >(overhead) << ", " << std::get< 1 >(overhead) << ", " << std::get< 2 >(overhead) << std::endl;
     }
     {
@@ -29,7 +34,7 @@ TEST(trace_test, test_basic_numbers) {
         std::cerr << "frame_guard::get() cycle overhead (min, avg, max): " << std::get< 0 >(overhead) << ", " << std::get< 1 >(overhead) << ", " << std::get< 2 >(overhead) << std::endl;
     }
 
-    std::cerr << "TRACE() overhead " << trace::frame_registry< trace::frame_data >::instance().trace_overhead() * trace::default_time_traits::get_frequency() << std::endl;
+    //std::cerr << "TRACE() overhead " << trace::frame_registry< trace::frame_data >::instance().trace_overhead() * trace::default_time_traits::get_frequency() << std::endl;
 }
 
 TEST(trace_test, test_stack) {
@@ -101,7 +106,7 @@ TEST(time_test, test_time_traits_sleep) {
     auto begin = Traits::begin();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     auto end = Traits::end();
-    std::cerr << Traits::diff(end, begin) << std::endl;
+    std::cerr << end - begin << std::endl;
 }
 
 void cycle(size_t n, volatile size_t* dummy, size_t loads = 1) {
@@ -280,27 +285,12 @@ template< typename Traits, typename Fn > void measure(Fn&& fn) {
 }
 
 TEST(time_test, test_cycle_timings) {
+    const size_t Loops = 32;
     size_t dummy;
-    for (size_t i = 0; i < 32; ++i) {
+    for (size_t i = 0; i < Loops; ++i) {
         std::cerr << "CYCLE " << i << std::endl;
         measure< trace::rdtscp_counter >([&] { cycle(i, &dummy); });
     }
-}
-
-uint64_t variance(uint64_t* inputs, size_t start, size_t end) {
-    uint64_t mean = 0;
-    for (size_t i = start; i < end; ++i) {
-        mean += inputs[i];
-    }
-    mean /= end - start;
-
-    uint64_t var = 0;
-    for (size_t i = start; i < end; ++i) {
-        var += (inputs[i] - mean) * (inputs[i] - mean);
-    }
-
-    var /= end - start;
-    return var;
 }
 
 // How to Benchmark Code Execution Times on Intel IA-32 and IA-64 Instruction Set Architectures
@@ -309,7 +299,7 @@ template< typename Counter, size_t Loops = 1000, typename Begin, typename End, s
     std::vector< std::array< uint64_t, N > > times(Loops);
     std::array< uint64_t, N > variances;
 
-    auto overhead = trace::default_time_traits::get_overhead();
+    auto overhead = trace::get_counter_overhead< Counter >();
 
     for (size_t n = 0; n < Loops; ++n) {
         for (size_t i = 0; i < N; ++i) {
@@ -322,7 +312,8 @@ template< typename Counter, size_t Loops = 1000, typename Begin, typename End, s
 
         std::sort(times[n].begin(), times[n].end(), [](auto lhs, auto rhs){ return lhs < rhs; });
         
-        uint64_t min_time = -1, max_time = 0, var, max_dev, mean = 0, sd;
+        uint64_t min_time = -1, max_time = 0, max_dev;
+        double mean = 0, sd = 0, var = 0;
         for (size_t i = Begin::value() * N; i < End::value() * N; ++i) {
             min_time = std::min(times[n][i], min_time);
             max_time = std::max(times[n][i], max_time);
@@ -330,7 +321,7 @@ template< typename Counter, size_t Loops = 1000, typename Begin, typename End, s
         }
         mean /= N*(End::value() - Begin::value());
         max_dev = max_time - min_time;
-        var = variance(times[n].data(), Begin::value()*N, End::value()*N);
+        var = trace::variance(times[n].data(), Begin::value()*N, End::value()*N);
         sd = sqrt(var);
         variances[n] = var;
 
@@ -342,7 +333,7 @@ template< typename Counter, size_t Loops = 1000, typename Begin, typename End, s
 }
 
 TEST(time_test, test_counter_stats) {
-    const int Loops = 32;
+    const size_t Loops = 32;
     volatile size_t dummy;
     test_counter< trace::rdtscp_counter, Loops, trace::ratio<0>, trace::ratio<3,4> >([&](size_t n){ cycle(n, &dummy); });
 }

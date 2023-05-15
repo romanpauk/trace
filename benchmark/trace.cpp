@@ -5,6 +5,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <benchmark/benchmark.h>
 #include <trace/trace.h>
 #include <string>
@@ -14,7 +19,7 @@ BENCHMARK_MAIN();
 
 template< typename T > static void time_traits(benchmark::State& state)
 {
-    typename T::value_type start, end;
+    uint64_t start, end;
     for (auto _ : state) {
         start = T::begin();
         end = T::end();
@@ -60,12 +65,12 @@ static void BM_MapCopyTrace(benchmark::State& state)
 }
 
 #if defined(_WIN32)
-BENCHMARK_TEMPLATE(time_traits, trace::qpc_time_traits);
+BENCHMARK_TEMPLATE(time_traits, trace::time_traits< trace::qpc_counter >);
 #endif
 
 #if defined(__linux__)
-BENCHMARK_TEMPLATE(time_traits, trace::clock_gettime_time_traits< CLOCK_MONOTONIC >);
-BENCHMARK_TEMPLATE(time_traits, trace::clock_gettime_time_traits< CLOCK_THREAD_CPUTIME_ID >);
+BENCHMARK_TEMPLATE(time_traits, trace::time_traits< trace::clock_gettime_counter< CLOCK_MONOTONIC > >);
+BENCHMARK_TEMPLATE(time_traits, trace::time_traits< trace::clock_gettime_counter< CLOCK_THREAD_CPUTIME_ID > >);
 #endif
 
 BENCHMARK_TEMPLATE(time_traits, trace::default_time_traits);

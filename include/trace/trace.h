@@ -10,6 +10,12 @@
 // inject frame_registry
 // get rid of time/count, use histogram (?)
 
+#pragma once
+
+#define TRACE_ENABLED
+#define TRACE_COMPENSATION_ENABLED
+#define TRACE_SAMPLING_ENABLED
+
 #include <array>
 #include <mutex>
 #include <unordered_map>
@@ -33,12 +39,6 @@
 #include <x86intrin.h>
 #include <ctime>
 #endif
-
-#pragma once
-
-#define TRACE_ENABLED
-#define TRACE_COMPENSATION_ENABLED
-#define TRACE_SAMPLING_ENABLED
 
 namespace trace {
     template< size_t N, size_t D = 1 > struct ratio {
@@ -761,10 +761,10 @@ namespace trace {
 
         void operator () (const frame_data& data, size_t level) {
             auto overhead = frame_guard< frame_data >::get_overhead();
-        #if defined(TRACE_TIME_COMPENSATION_ENABLED)
+        #if defined(TRACE_COMPENSATION_ENABLED)
             auto time_total = default_time_traits::to_time(trace::compensate(overhead, data.value(), data.exclusive_count()) * _scale) / 1e6;
         #else
-            auto time_total = default_time_traits::to_time(data.value() * _scale / data.exclusive_count()) / 1e6;
+            auto time_total = default_time_traits::to_time(data.value() * _scale) / 1e6;
         #endif
             auto time_avg = time_total / data.exclusive_count();
             auto overhead_count = std::max(uint64_t(0), data.inclusive_count() - data.exclusive_count());
